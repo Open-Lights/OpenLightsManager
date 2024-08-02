@@ -1,0 +1,23 @@
+[package]
+name = "OpenLightsManager"
+version = "1.0.0"
+edition = "2021"
+authors = ["QPCrummer"]
+include = ["**/*.rs", "Cargo.toml"]
+
+[dependencies]
+egui = "0.28.1"
+egui_extras = { version = "0.28.1", features = ["image"] }
+image = { version = "0.25.1", default-features = false, features = [
+    "png",
+] }
+eframe = { version = "0.28.1", default-features = false, features = [
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+] }
+reqwest = "0.12.5"
+serde = {version = "1.0.204", features = ["derive"]}
+serde_json = "1.0.121"
+tokio = { version = "1.39.2", features = ["rt-multi-thread"] }
+egui_file = "0.18.0"
+fastrand = "2.1.0"
