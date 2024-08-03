@@ -5,13 +5,17 @@ use std::i32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI8, Ordering};
 use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Color32, Context, FontFamily, FontId, Frame, Image, Pos2, pos2, Rect, RichText, Rounding, Stroke, TextStyle, Ui, Vec2};
+use egui::{CentralPanel, Color32, Context, FontFamily, FontId, Frame, Image, Pos2, pos2, ProgressBar, Rect, RichText, Rounding, Stroke, TextStyle, Ui, Vec2};
 use egui::TextStyle::Body;
 use egui_file::FileDialog;
 use serde::{Deserialize, Serialize};
 
+use crate::io::{check_for_all_updates, download_application, gather_app_data, should_check_github};
+use crate::notifications::{java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, rate_limit_notification};
 use crate::settings::{load_settings, Settings};
 
 pub struct OpenLightsManager {
@@ -21,6 +25,7 @@ pub struct OpenLightsManager {
     settings: Settings,
     theme: Theme,
     file_explorer: FileExplorer,
+    download_progress: Arc<AtomicI8>,
 }
 
 #[derive(PartialEq, Default)]
@@ -95,15 +100,20 @@ fn update_theme(ui: &mut Ui, open_lights_manager: &&mut OpenLightsManager) {
     ui.style_mut().visuals.widgets.active.bg_fill = open_lights_manager.theme.clicked;
     ui.style_mut().visuals.widgets.hovered.weak_bg_fill = open_lights_manager.theme.hovered;
     ui.style_mut().visuals.widgets.hovered.bg_fill = open_lights_manager.theme.hovered;
+    ui.style_mut().visuals.extreme_bg_color = open_lights_manager.theme.button;
 }
 
 impl OpenLightsManager {
     pub fn new(ctx: &Context) -> Self {
         configure_text_styles(ctx);
 
-        let settings = load_settings();
-        //let apps = gather_app_data(settings.unstable_releases);
-        let apps = Vec::new();
+        let mut settings = load_settings();
+        let mut notifications = VecDeque::new();
+        let apps_pre = gather_app_data(settings.unstable_releases, &mut settings);
+        if let Some(notification) = apps_pre.1 {
+            notifications.push_front(notification);
+        };
+        let apps = apps_pre.0;
         let theme = Theme::get_theme(&settings);
         let file_explorer = FileExplorer {
             opened_file: None,
@@ -112,11 +122,12 @@ impl OpenLightsManager {
 
         OpenLightsManager {
             current_screen: Screen::default(),
-            notifications: VecDeque::new(),
+            notifications,
             apps,
             settings,
             theme,
             file_explorer,
+            download_progress: Arc::new(AtomicI8::new(0)),
         }
     }
 
@@ -172,11 +183,13 @@ impl OpenLightsManager {
     pub fn render_installation(&mut self, ui: &mut Ui) {
         let rect = Self::tab_area();
         ui.painter().rect(rect, Rounding::same(16.), self.theme.panel, Stroke::NONE);
+        self.render_app_panel(ui, true);
     }
 
     pub fn render_browse(&mut self, ui: &mut Ui) {
         let rect = Self::tab_area();
         ui.painter().rect(rect, Rounding::same(16.), self.theme.panel, Stroke::NONE);
+        self.render_app_panel(ui, false);
     }
 
     pub fn render_settings(&mut self, ui: &mut Ui) {
@@ -185,7 +198,7 @@ impl OpenLightsManager {
         self.render_settings_panel(ui);
     }
 
-    fn render_app_panel(&mut self, ui: &mut Ui) {
+    fn render_app_panel(&mut self, ui: &mut Ui, install_only: bool) {
         let rect = Self::scroll_area();
 
         ui.allocate_ui_at_rect(rect, |ui| {
@@ -194,7 +207,9 @@ impl OpenLightsManager {
                 .max_width(550.)
                 .show(ui, |ui| {
                     for (index, app) in self.apps.iter_mut().enumerate() {
-                        app.render(ui, index as i8);
+                        if (install_only && app.installed) || (!install_only && !app.installed) {
+                            app.render(ui, index as i8, &self.theme);
+                        }
                     }
                 });
         });
@@ -245,12 +260,7 @@ impl OpenLightsManager {
                             let filename = path.file_stem().unwrap().to_string_lossy().to_string();
 
                             if filename != "java" && filename != "javaw" {
-                                let notification = Notification {
-                                    title: "Java Check Failure".to_string(),
-                                    message: "An invalid Java Runtime has been provided.\nEnsure \"javaw\" or \"java\" has been selected.".to_string(),
-                                    timer: Timer::new(Duration::from_secs(15)),
-                                    id: fastrand::i32(0..i32::MAX),
-                                };
+                                let notification = java_failure_invalid();
                                 self.notifications.push_front(notification);
                                 println!("Not a valid Java Installation: {}", filename);
                             } else {
@@ -266,33 +276,46 @@ impl OpenLightsManager {
                                                 .lines()
                                                 .nth(1) // Get the second line
                                                 .unwrap_or_default();
-                                            let notification = Notification {
-                                                title: "Java Check Success".to_string(),
-                                                message: format!("{} has been checked.", stdout_as_string),
-                                                timer: Timer::new(Duration::from_secs(15)),
-                                                id: fastrand::i32(0..i32::MAX),
-                                            };
+                                            let notification = java_success(stdout_as_string.to_string());
                                             self.notifications.push_front(notification);
                                         } else {
-                                            let notification = Notification {
-                                                title: "Java Check Failure".to_string(),
-                                                message: "The provided Java Runtime is either invalid or corrupted.\nTry a different Java Runtime or reinstall the current one.".to_string(),
-                                                timer: Timer::new(Duration::from_secs(15)),
-                                                id: fastrand::i32(0..i32::MAX),
-                                            };
+                                            let notification = java_failure_corrupted();
                                             self.notifications.push_front(notification);
                                         }
                                     }
                                     Err(e) => {
-                                        let notification = Notification {
-                                            title: "Java Check Failure".to_string(),
-                                            message: "Failed to run the Java Check.\nPlease try running the Java Check again.\nIf the issue continues, report the issue on Github.".to_string(),
-                                            timer: Timer::new(Duration::from_secs(15)),
-                                            id: fastrand::i32(0..i32::MAX),
-                                        };
+                                        let notification = java_failure_issue();
                                         self.notifications.push_front(notification);
                                     }
                                 }
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized([100., 50.], egui::Label::new(RichText::new("Github Token: ").color(self.theme.text)));
+                        if ui.add_sized([250., 30.], egui::TextEdit::singleline(&mut self.settings.github_token).hint_text("Ex: <insert_example>").text_color(self.theme.text)).lost_focus() {
+                            self.settings.save_settings();
+                        };
+                        ui.add_sized([50., 30.], egui::Hyperlink::from_label_and_url(RichText::new("Help").color(Color32::BLUE).underline(), "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token"));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized([100., 50.], egui::Label::new(RichText::new("Override Rate Limiter").color(self.theme.text)));
+                        if ui.add_sized([50., 50.], egui::Checkbox::without_text(&mut self.settings.override_rate_limit)).clicked() {
+                            self.settings.save_settings();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized([100., 50.], egui::Label::new(RichText::new("Last Update Check: ").color(self.theme.text)));
+                        ui.add_sized([100., 50.], egui::Label::new(RichText::new(&self.settings.last_github_check_formatted).color(self.theme.text)));
+                        if ui.add_sized([25., 25.], egui::Button::new(RichText::new("↻").color(self.theme.text))).clicked() {
+                            if should_check_github(&self.settings) {
+                                check_for_all_updates(&mut self.apps, self.settings.unstable_releases, &mut self.settings)
+                            } else {
+                                let notification = rate_limit_notification();
+                                self.notifications.push_front(notification);
                             }
                         }
                     });
@@ -415,9 +438,11 @@ impl Theme {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct App {
     pub installed: bool,
+    #[serde(skip)]
+    pub installing: bool,
     pub(crate) name: String,
     pub path: String,
-    pub version: Version,
+    pub version: String,
     pub(crate) image_url: String,
     pub github_repo: String,
     pub(crate) github_data: GithubData,
@@ -430,7 +455,7 @@ impl App {
     pub fn default(
         name: String,
         path: String,
-        version: Version,
+        version: String,
         image_url: String,
         github_repo: String,
         github_data: GithubData,
@@ -440,6 +465,7 @@ impl App {
     ) -> Self {
         App {
             installed: false,
+            installing: false,
             name,
             path,
             version,
@@ -454,33 +480,44 @@ impl App {
 }
 
 impl App {
-    pub fn render(&mut self, ui: &mut Ui, index: i8) {
+    pub fn render(&mut self, ui: &mut Ui, index: i8, theme: &Theme, progress: Arc<AtomicI8>) {
         let img_rect = Rect::from_two_pos(pos2(30., (100 * index) as f32 + 160.), pos2(130., (100 * index) as f32 + 260.));
         app_image(&self.name, ui, img_rect);
 
         let name_rect = Rect::from_two_pos(pos2(140., (100 * index) as f32 + 170.), pos2(460., (100 * index) as f32 + 210.));
-        ui.put(name_rect, egui::Label::new(&self.name));
+        ui.put(name_rect, egui::Label::new(RichText::new(&self.name).color(theme.text).strong()));
 
         let button_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 170.), pos2(570., (100 * index) as f32 + 210.));
 
         if !&self.installed {
-            if ui.put(button_rect, egui::Button::new("Install")).clicked() {
-                // TODO Install
+            let install_text;
+            if self.installing {
+                install_text = "Installing";
+                let progress_bar_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 215.), pos2(570., (100 * index) as f32 + 245.));
+                let prgs = progress.load(Ordering::Relaxed);
+                ui.put(progress_bar_rect, ProgressBar::new(prgs as f32 / 100.));
+            } else {
+                install_text = "Install";
             }
+            ui.add_enabled_ui(!self.installing, |ui| {
+                if ui.put(button_rect, egui::Button::new(RichText::new("Install").color(theme.text)).fill(theme.button)).clicked() {
+                    download_application(self, progress, )
+                }
+            });
         }
 
         if self.has_update {
-            if ui.put(button_rect, egui::Button::new("Update")).clicked() {
+            if ui.put(button_rect, egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
                 // TODO Update
             }
         }
 
         let description_rect = Rect::from_two_pos(pos2(140., (100 * index) as f32 + 220.), pos2(460., (100 * index) as f32 + 260.));
-        ui.put(description_rect, egui::Label::new(RichText::new(&self.github_data.description).text_style(notification_font())));
+        ui.put(description_rect, egui::Label::new(RichText::new(&self.github_data.description).color(theme.text).text_style(notification_font())));
 
         if self.installed {
             let ver_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 220.), pos2(570., (100 * index) as f32 + 260.));
-            ui.put(ver_rect, egui::Label::new(&self.version.as_string()));
+            ui.put(ver_rect, egui::Label::new(&self.version.to_string()));
         }
     }
 }
@@ -502,69 +539,18 @@ fn app_image(name: &String, ui: &mut Ui, img_rect: Rect) {
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
                 .paint_at(ui, img_rect);
         },
+        "graalvm-ce-builds" => {
+            Image::new(egui::include_image!("../assets/graalvm-ce-builds.png"))
+                .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .paint_at(ui, img_rect);
+        }
         _ => {}
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Copy, Clone)]
-pub struct Version {
-    major: i8,
-    minor: i8,
-    patch: i32,
-    release: bool,
-}
-
-impl PartialEq for Version {
-    fn eq(&self, other: &Self) -> bool {
-        self.major == other.major && self.minor == self.minor && self.patch == self.patch
-    }
-}
-
-impl Version {
-    pub fn compare(version_1: Version, version_2: Version) -> Version {
-        if version_1.major > version_2.major {
-            version_1
-        } else if version_2.major > version_1.major {
-            version_2
-        } else if version_1.minor > version_2.minor {
-            version_1
-        } else if version_2.minor > version_1.minor {
-            version_2
-        } else if version_1.patch > version_2.patch {
-            version_1
-        } else if version_2.patch > version_1.patch {
-            version_2
-        } else {
-            version_1 // They are actually the same version
-        }
-    }
-
-    pub fn is_old(&mut self, other_ver: Version) -> bool {
-        let outcome = Version::compare(self.clone(), other_ver);
-        outcome == other_ver
-    }
-
-    pub fn as_string(&mut self) -> String {
-        format!("{}.{}.{}", self.major, self.minor, self.patch)
-    }
-
-    pub fn from_string(ver: String, prerelease: bool) -> Version {
-        let parts: Vec<&str> = ver.split('.').collect();
-        let major = i8::from_str(parts[0]).unwrap();
-        let minor = i8::from_str(parts[1]).unwrap();
-        let patch= i32::from_str(parts[3]).unwrap();
-        Version {
-            major,
-            minor,
-            patch,
-            release: !prerelease,
-        }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct GithubData {
-    description: String,
+    pub(crate) description: String,
     pub(crate) releases_url: String,
 }
 
@@ -573,7 +559,7 @@ pub(crate) struct ReleaseData {
     pub tag_name: String,
     pub prerelease: bool,
     pub id: i32,
-    assets: Vec<AssetData>,
+    pub assets: Vec<AssetData>,
 }
 
 impl ReleaseData {
@@ -589,8 +575,8 @@ impl ReleaseData {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AssetData {
-    size: i32,
-    browser_download_url: String,
+    pub size: i32,
+    pub browser_download_url: String,
 }
 
 #[derive(Clone)]

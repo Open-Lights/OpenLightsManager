@@ -2,5 +2,6 @@
 
 pub mod gui;
 pub mod io;
+pub mod notifications;
 pub mod settings;
 pub use gui::OpenLightsManager;
