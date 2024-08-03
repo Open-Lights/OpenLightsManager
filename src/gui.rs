@@ -4,7 +4,6 @@ use std::ffi::OsStr;
 use std::i32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::time::{Duration, Instant};
@@ -14,8 +13,8 @@ use egui::TextStyle::Body;
 use egui_file::FileDialog;
 use serde::{Deserialize, Serialize};
 
-use crate::io::{check_for_all_updates, download_application, gather_app_data, should_check_github};
-use crate::notifications::{java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, rate_limit_notification};
+use crate::io::{check_for_all_updates, download_application, gather_app_data, save_app_data_offline, should_check_github};
+use crate::notifications::{app_installation_failure, app_installation_success, java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, rate_limit_notification};
 use crate::settings::{load_settings, Settings};
 
 pub struct OpenLightsManager {
@@ -208,7 +207,7 @@ impl OpenLightsManager {
                 .show(ui, |ui| {
                     for (index, app) in self.apps.iter_mut().enumerate() {
                         if (install_only && app.installed) || (!install_only && !app.installed) {
-                            app.render(ui, index as i8, &self.theme);
+                            app.render(ui, index as i8, &self.theme, &self.download_progress, &mut self.notifications);
                         }
                     }
                 });
@@ -283,7 +282,7 @@ impl OpenLightsManager {
                                             self.notifications.push_front(notification);
                                         }
                                     }
-                                    Err(e) => {
+                                    Err(_e) => {
                                         let notification = java_failure_issue();
                                         self.notifications.push_front(notification);
                                     }
@@ -339,7 +338,7 @@ pub struct FileExplorer {
 
 impl FileExplorer {
     pub fn render(&mut self, ctx: &Context, settings: &mut Settings) {
-        CentralPanel::default().show(ctx, |ui| {
+        CentralPanel::default().show(ctx, |_ui| {
             if let Some(dialog) = &mut self.open_file_dialog {
                 if dialog.show(ctx).selected() {
                     if let Some(file) = dialog.path() {
@@ -441,7 +440,8 @@ pub struct App {
     #[serde(skip)]
     pub installing: bool,
     pub(crate) name: String,
-    pub path: String,
+    pub path: String, // This is the app_data path
+    pub app_path: String, // This is the executable path
     pub version: String,
     pub(crate) image_url: String,
     pub github_repo: String,
@@ -468,6 +468,7 @@ impl App {
             installing: false,
             name,
             path,
+            app_path: String::new(),
             version,
             image_url,
             github_repo,
@@ -480,7 +481,7 @@ impl App {
 }
 
 impl App {
-    pub fn render(&mut self, ui: &mut Ui, index: i8, theme: &Theme, progress: Arc<AtomicI8>) {
+    pub fn render(&mut self, ui: &mut Ui, index: i8, theme: &Theme, progress: &Arc<AtomicI8>, notifications: &mut VecDeque<Notification>) {
         let img_rect = Rect::from_two_pos(pos2(30., (100 * index) as f32 + 160.), pos2(130., (100 * index) as f32 + 260.));
         app_image(&self.name, ui, img_rect);
 
@@ -492,16 +493,31 @@ impl App {
         if !&self.installed {
             let install_text;
             if self.installing {
+                ui.ctx().request_repaint_after(Duration::from_millis(10));
                 install_text = "Installing";
                 let progress_bar_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 215.), pos2(570., (100 * index) as f32 + 245.));
                 let prgs = progress.load(Ordering::Relaxed);
+                if prgs == 101 {
+                    self.installing = false;
+                    self.installed = true;
+                    progress.store(0, Ordering::Relaxed);
+                    save_app_data_offline(self);
+                    let notification = app_installation_success(&self.name);
+                    notifications.push_front(notification);
+                } else if prgs == -1 {
+                    self.installing = false;
+                    progress.store(0, Ordering::Relaxed);
+                    let notification = app_installation_failure(&self.name);
+                    notifications.push_front(notification);
+                }
+
                 ui.put(progress_bar_rect, ProgressBar::new(prgs as f32 / 100.));
             } else {
                 install_text = "Install";
             }
             ui.add_enabled_ui(!self.installing, |ui| {
-                if ui.put(button_rect, egui::Button::new(RichText::new("Install").color(theme.text)).fill(theme.button)).clicked() {
-                    download_application(self, progress, )
+                if ui.put(button_rect, egui::Button::new(RichText::new(install_text).color(theme.text)).fill(theme.button)).clicked() {
+                    download_application(self, progress);
                 }
             });
         }
@@ -562,19 +578,8 @@ pub(crate) struct ReleaseData {
     pub assets: Vec<AssetData>,
 }
 
-impl ReleaseData {
-    pub fn clone(&mut self) -> Self {
-        ReleaseData {
-            tag_name: self.tag_name.clone(),
-            prerelease: self.prerelease,
-            id: self.id,
-            assets: self.assets.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct AssetData {
+pub struct AssetData {
     pub size: i32,
     pub browser_download_url: String,
 }

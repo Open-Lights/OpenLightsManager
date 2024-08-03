@@ -1,4 +1,4 @@
-use std::{fs, thread};
+use std::{fs, io, thread};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI8, Ordering};
 
 use chrono::Utc;
+use futures_util::StreamExt;
 use reqwest::header;
 use semver::{Version, VersionReq};
+use serde::Deserialize;
 use tokio::runtime::Runtime;
-
+use zip::ZipArchive;
 use crate::gui::{App, GithubData, Notification};
 use crate::notifications::rate_limit_notification;
 use crate::settings::Settings;
@@ -54,10 +56,11 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     continue;
                 }
                 let version = parse_semver(&latest_data.1.tag_name);
-                let app = App {
+                let mut app = App {
                     installed: false,
                     installing: false,
                     path: path.to_string_lossy().to_string(),
+                    app_path: String::new(),
                     name: project_name.to_string(),
                     version: version.to_string(),
                     image_url: format!("../assets/{}.png", project_name),
@@ -65,8 +68,11 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     github_data: latest_data.0,
                     release_data: latest_data.1,
                     has_update: false,
-                    launchable: false, //TODO Determine if it is launchable during installation
+                    launchable: false,
                 };
+                let installation_data = get_installation_data(&app);
+                app.app_path = installation_data.app_path; //TODO Proper app path
+                app.launchable = installation_data.launchable;
                 save_app_data(app.clone(), prerelease, settings);
                 vector.push(app);
             }
@@ -184,6 +190,10 @@ pub fn save_apps_data(apps: Vec<App>, prerelease: bool, settings: &mut Settings)
 
 pub fn save_app_data(mut app: App, prerelease: bool, settings: &mut Settings) {
     check_for_updates(&mut app, prerelease, settings, false);
+    save_app_data_offline(&app);
+}
+
+pub fn save_app_data_offline(app: &App) {
     let path: &Path = Path::new(&app.path);
     let file: File = if path.exists() {
         OpenOptions::new()
@@ -288,35 +298,43 @@ fn set_checked_for_update(settings: &mut Settings) {
 
 // File downloading
 // Extension includes the period
-pub fn download_application(app: &mut App, progress: Arc<AtomicI8>, extension: Option<String>, keyword: Option<String>) {
+pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
     app.installing = true;
+    let app_clone = app.clone();
+    let progress_clone = Arc::clone(&progress);
     thread::spawn(move || {
         let application_path = Path::new("openlightsmanager/apps/");
         if !application_path.exists() {
             fs::create_dir_all(application_path).unwrap();
         }
-        for asset in app.release_data.assets {
+        for asset in &app_clone.release_data.assets {
             let filename = asset.browser_download_url.split('/').last().unwrap_or("unknown");
+            println!("Examining {}", filename);
             let parts: Vec<&str> = filename.split('.').collect();
             let asset_extension = parts.last().unwrap_or(&"").to_string();
             //let filename_without_extension = parts.get(0).unwrap_or(&"").to_string();
 
-            if let Some(extension_comparing) = &extension {
-                if asset_extension.ne(extension_comparing) {
+            let installation_data = get_installation_data(&app_clone);
+
+            if let Some(extension_comparing) = installation_data.extension {
+                if asset_extension.ne(&extension_comparing) {
+                    println!("Bad: extension mismatch; Provided {}, Expected {}", asset_extension, extension_comparing);
                     continue;
                 }
             }
 
-            if let Some(key) = &keyword {
-                if !filename.contains(key) {
+            if let Some(key) = installation_data.key_word {
+                if !filename.contains(key.as_str()) {
+                    println!("Bad: key word mismatch");
                     continue;
                 }
             }
 
+            println!("Success");
             let path_str = if is_archive(&asset_extension) {
                 format!("openlightsmanager/apps/{}", filename)
             } else {
-                let parent_str =   format!("openlightsmanager/apps/{}/", app.name);
+                let parent_str =   format!("openlightsmanager/apps/{}/", &app_clone.name);
                 let parent_path = Path::new(&parent_str);
                 if !parent_path.exists() {
                     fs::create_dir_all(parent_path).unwrap();
@@ -324,8 +342,43 @@ pub fn download_application(app: &mut App, progress: Arc<AtomicI8>, extension: O
                 format!("{}{}", parent_str, filename)
             };
             let rt = Runtime::new().unwrap();
-            rt.block_on(get_file(&asset.browser_download_url, path_str, &progress));
+            rt.block_on(get_file(&asset.browser_download_url, path_str.clone(), &progress_clone));
+
+            if is_archive(&asset_extension) {
+                let extracted_path_str = format!("openlightsmanager/apps/{}/", &app_clone.name);
+                let extracted_path = Path::new(&extracted_path_str);
+                if !extracted_path.exists() {
+                    fs::create_dir(extracted_path).unwrap();
+                }
+                let path = Path::new(&path_str);
+                let file = File::open(path).unwrap();
+                let mut archive = ZipArchive::new(file).unwrap();
+
+                for i in 0..archive.len() {
+                    let mut file = archive.by_index(i).unwrap();
+                    let file_name = file.sanitized_name();
+                    let extracted_file_path = extracted_path.join(file_name);
+
+                    if file.is_dir() {
+                        fs::create_dir_all(&extracted_file_path).unwrap();
+                    } else {
+                        let parent = extracted_file_path.parent().unwrap();
+                        if !parent.exists() {
+                            fs::create_dir_all(parent).unwrap();
+                        }
+                        let mut extracted_file = File::create(&extracted_file_path).unwrap();
+                        io::copy(&mut file, &mut extracted_file).unwrap();
+                    }
+                }
+
+                fs::remove_file(path).unwrap();
+            }
+
+            progress_clone.store(101, Ordering::Relaxed);
+            return;
         }
+        println!("Failed to install");
+        progress_clone.store(-1, Ordering::Relaxed);
     });
 }
 
@@ -348,11 +401,31 @@ async fn get_file(url: &String, path: String, progress: &Arc<AtomicI8>) {
 }
 
 fn is_archive(extension: &String) -> bool {
-    match extension {
-        String::from(".zip") => true,
-        String::from(".rar") => true,
-        String::from(".7z") => true,
-        String::from(".tar") => true,
-        String::from(".gz") => true,
+    match extension.as_str() {
+        "zip" => true,
+        "rar" => true,
+        "7z" => true,
+        "tar" => true,
+        "gz" => true,
+        _ => false,
     }
+}
+
+#[derive(Deserialize)]
+struct InstallationData {
+    launchable: bool,
+    is_library: bool,
+    extension: Option<String>,
+    key_word: Option<String>,
+    app_path: String,
+}
+
+fn get_installation_data(app: &App) -> InstallationData {
+    let path_str = format!("assets/{}.json", app.name);
+    let path = Path::new(&path_str);
+    println!("InstallDataPath: {}", path_str);
+    let file = File::open(path).unwrap();
+    let mut reader = BufReader::new(file);
+    let result: Result<InstallationData, serde_json::Error> = serde_json::from_reader(&mut reader);
+    result.unwrap()
 }

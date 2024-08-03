@@ -45,3 +45,21 @@ pub fn java_success(stdout: String) -> Notification {
         id: fastrand::i32(0..i32::MAX),
     }
 }
+
+pub fn app_installation_failure(app: &String) -> Notification {
+    Notification {
+        title: "App Installation Failure".to_string(),
+        message: format!("{} has failed to install.\nEnsure your device is connected to the Internet.", app),
+        timer: Timer::new(Duration::from_secs(15)),
+        id: fastrand::i32(0..i32::MAX),
+    }
+}
+
+pub fn app_installation_success(app: &String) -> Notification {
+    Notification {
+        title: "App Installation Successful".to_string(),
+        message: format!("{} has installed.", app),
+        timer: Timer::new(Duration::from_secs(15)),
+        id: fastrand::i32(0..i32::MAX),
+    }
+}
