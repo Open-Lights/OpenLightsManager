@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use egui::Vec2;
-use OpenLightsManager::gui;
+use open_lights_manager::gui;
 
 fn main() -> eframe::Result<()> {
 
