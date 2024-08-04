@@ -362,6 +362,7 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sen
                 let total_files = archive.len();
                 for i in 0..total_files {
                     let mut file = archive.by_index(i).unwrap();
+                    #[allow(deprecated)]
                     let file_name = file.sanitized_name();
                     let extracted_file_path = extracted_path.join(file_name);
 

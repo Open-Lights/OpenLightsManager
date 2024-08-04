@@ -80,6 +80,7 @@ impl eframe::App for OpenLightsManager {
         CentralPanel::default().show(ctx, |ui| {
             self.file_explorer.render(ctx, &mut self.settings);
             if let Some(file_explorer) = &self.file_explorer.open_file_dialog {
+                #[allow(deprecated)]
                 ui.set_enabled(!file_explorer.visible());
             }
             update_theme(ui, &self);
@@ -614,13 +615,13 @@ fn app_image(name: &String, ui: &mut Ui, img_rect: Rect) {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct GithubData {
+pub struct GithubData {
     pub(crate) description: String,
     pub(crate) releases_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct ReleaseData {
+pub struct ReleaseData {
     pub tag_name: String,
     pub prerelease: bool,
     pub id: i32,
@@ -641,7 +642,7 @@ pub struct Notification {
     pub id: i32,
 }
 
-fn notify(ctx: &Context, notification: Notification, mut notifications: &mut VecDeque<Notification>) {
+fn notify(ctx: &Context, notification: Notification, notifications: &mut VecDeque<Notification>) {
     notifications.push_front(notification);
     ctx.request_repaint_after(Duration::from_millis(10));
 }
