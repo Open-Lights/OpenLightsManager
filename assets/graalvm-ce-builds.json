@@ -1,7 +1,9 @@
 {
     "launchable": false,
     "is_library": true,
+    "is_manager": false,
+    "has_extra_folder": true,
     "extension": "zip",
     "key_word": "windows",
-    "app_path": "graal_folder_name/bin/javaw.exe"
+    "app_path": "/bin/javaw.exe"
 }

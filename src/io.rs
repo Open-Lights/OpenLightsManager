@@ -4,7 +4,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI8, Ordering};
-
+use std::sync::mpsc::Sender;
 use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::header;
@@ -58,7 +58,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                 let version = parse_semver(&latest_data.1.tag_name);
                 let mut app = App {
                     installed: false,
-                    installing: false,
+                    event: InstallationEvents::default(),
                     path: path.to_string_lossy().to_string(),
                     app_path: String::new(),
                     name: project_name.to_string(),
@@ -298,8 +298,7 @@ fn set_checked_for_update(settings: &mut Settings) {
 
 // File downloading
 // Extension includes the period
-pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
-    app.installing = true;
+pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sender<(InstallationEvents, Option<String>)>) {
     let app_clone = app.clone();
     let progress_clone = Arc::clone(&progress);
     thread::spawn(move || {
@@ -312,7 +311,6 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
             println!("Examining {}", filename);
             let parts: Vec<&str> = filename.split('.').collect();
             let asset_extension = parts.last().unwrap_or(&"").to_string();
-            //let filename_without_extension = parts.get(0).unwrap_or(&"").to_string();
 
             let installation_data = get_installation_data(&app_clone);
 
@@ -345,7 +343,14 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
             rt.block_on(get_file(&asset.browser_download_url, path_str.clone(), &progress_clone));
 
             if is_archive(&asset_extension) {
-                let extracted_path_str = format!("openlightsmanager/apps/{}/", &app_clone.name);
+                send_event(&sender, InstallationEvents::Extracting, None);
+                progress_clone.store(0, Ordering::Relaxed);
+
+                let extracted_path_str = if installation_data.has_extra_folder {
+                    String::from("openlightsmanager/apps/")
+                } else {
+                    format!("openlightsmanager/apps/{}/", &app_clone.name)
+                };
                 let extracted_path = Path::new(&extracted_path_str);
                 if !extracted_path.exists() {
                     fs::create_dir(extracted_path).unwrap();
@@ -354,7 +359,8 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
                 let file = File::open(path).unwrap();
                 let mut archive = ZipArchive::new(file).unwrap();
 
-                for i in 0..archive.len() {
+                let total_files = archive.len();
+                for i in 0..total_files {
                     let mut file = archive.by_index(i).unwrap();
                     let file_name = file.sanitized_name();
                     let extracted_file_path = extracted_path.join(file_name);
@@ -369,16 +375,46 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>) {
                         let mut extracted_file = File::create(&extracted_file_path).unwrap();
                         io::copy(&mut file, &mut extracted_file).unwrap();
                     }
+
+                    let progress = ((i as f32 + 1.) * 100.) / total_files as f32;
+                    let progress_rounded = progress.ceil() as i8;
+                    progress_clone.store(progress_rounded, Ordering::Relaxed);
+                }
+
+                // App-specific tasks
+
+                if installation_data.has_extra_folder {
+                    for entry in extracted_path.read_dir().expect("Failed to read directory") {
+                        if let Ok(entry) = entry {
+                            let entry_path = entry.path();
+                            if entry_path.is_dir() {
+                                let new_entry_path_str = format!("openlightsmanager/apps/{}/", &app_clone.name);
+                                let new_entry_path = Path::new(&new_entry_path_str);
+                                fs::rename(entry_path, new_entry_path).unwrap();
+                            }
+                        }
+                    }
                 }
 
                 fs::remove_file(path).unwrap();
             }
 
-            progress_clone.store(101, Ordering::Relaxed);
+            // Is Java
+            if installation_data.is_library && filename.contains("jdk") {
+                send_event(&sender, InstallationEvents::JavaInstalled, Some(installation_data.app_path));
+            } else if installation_data.is_manager {
+                // TODO Remove old exe
+                send_event(&sender, InstallationEvents::ManagerInstalled, None);
+            } else {
+                send_event(&sender, InstallationEvents::AppInstalled, None);
+            }
+            progress_clone.store(0, Ordering::Relaxed);
+            println!("Finished Installing!");
             return;
         }
         println!("Failed to install");
-        progress_clone.store(-1, Ordering::Relaxed);
+        send_event(&sender, InstallationEvents::Failed, None); // TODO Send failure message
+        progress_clone.store(0, Ordering::Relaxed);
     });
 }
 
@@ -415,6 +451,8 @@ fn is_archive(extension: &String) -> bool {
 struct InstallationData {
     launchable: bool,
     is_library: bool,
+    is_manager: bool,
+    has_extra_folder: bool,
     extension: Option<String>,
     key_word: Option<String>,
     app_path: String,
@@ -428,4 +466,20 @@ fn get_installation_data(app: &App) -> InstallationData {
     let mut reader = BufReader::new(file);
     let result: Result<InstallationData, serde_json::Error> = serde_json::from_reader(&mut reader);
     result.unwrap()
+}
+
+#[derive(Default, Clone, Debug, PartialEq)]
+pub enum InstallationEvents {
+    #[default]
+    None,
+    Downloading,
+    Extracting,
+    AppInstalled,
+    Failed,
+    JavaInstalled,
+    ManagerInstalled,
+}
+
+fn send_event(sender: &Sender<(InstallationEvents, Option<String>)>, event: InstallationEvents, data: Option<String>) {
+    sender.send((event, data)).unwrap();
 }

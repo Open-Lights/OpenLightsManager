@@ -63,3 +63,12 @@ pub fn app_installation_success(app: &String) -> Notification {
         id: fastrand::i32(0..i32::MAX),
     }
 }
+
+pub fn manager_installation_success() -> Notification {
+    Notification {
+        title: "Open Lights Manager Installation Successful".to_string(),
+        message: "Please restart this application for the update to complete.".to_string(),
+        timer: Timer::new(Duration::from_secs(15)),
+        id: fastrand::i32(0..i32::MAX),
+    }
+}
