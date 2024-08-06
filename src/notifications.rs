@@ -72,3 +72,21 @@ pub fn manager_installation_success() -> Notification {
         id: fastrand::i32(0..i32::MAX),
     }
 }
+
+pub fn launched_application(name: &String) -> Notification {
+    Notification {
+        title: format!("{} is launching...", name),
+        message: "The application will open momentarily.\nPlease wait.".to_string(),
+        timer: Timer::new(Duration::from_secs(10)),
+        id: fastrand::i32(0..i32::MAX),
+    }
+}
+
+pub fn launched_application_missing_java(name: &String) -> Notification {
+    Notification {
+        title: format!("{} failed to launch", name),
+        message: "The application requires a Java Environment.\nPlease install GraalVM from the Browse tab.".to_string(),
+        timer: Timer::new(Duration::from_secs(15)),
+        id: fastrand::i32(0..i32::MAX),
+    }
+}

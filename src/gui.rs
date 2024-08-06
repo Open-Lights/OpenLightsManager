@@ -1,11 +1,11 @@
 use std::cmp::PartialEq;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::i32;
+use std::{fs, i32};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use egui::TextStyle::Body;
 use egui_file::FileDialog;
 use serde::{Deserialize, Serialize};
 
-use crate::io::{check_for_all_updates, download_application, gather_app_data, InstallationEvents, save_app_data_offline, should_check_github};
+use crate::io::{AppEvents, check_for_all_updates, download_application, gather_app_data, get_installation_data, launch_application, save_app_data_offline, should_check_github};
 use crate::notifications::{app_installation_failure, app_installation_success, java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, manager_installation_success, rate_limit_notification};
 use crate::settings::{load_settings, Settings};
 
@@ -25,9 +25,6 @@ pub struct OpenLightsManager {
     settings: Settings,
     theme: Theme,
     file_explorer: FileExplorer,
-    download_progress: Arc<AtomicI8>,
-    settings_receiver: Receiver<(InstallationEvents, Option<String>)>,
-    settings_sender: Sender<(InstallationEvents, Option<String>)>,
 }
 
 #[derive(PartialEq, Default)]
@@ -123,8 +120,6 @@ impl OpenLightsManager {
             open_file_dialog: None,
         };
 
-        let (tx_settings, rx_settings) = mpsc::channel();
-
         OpenLightsManager {
             current_screen: Screen::default(),
             notifications,
@@ -132,9 +127,6 @@ impl OpenLightsManager {
             settings,
             theme,
             file_explorer,
-            download_progress: Arc::new(AtomicI8::new(0)),
-            settings_receiver: rx_settings,
-            settings_sender: tx_settings,
         }
     }
 
@@ -213,9 +205,10 @@ impl OpenLightsManager {
                 .max_height(420.)
                 .max_width(550.)
                 .show(ui, |ui| {
-                    for (index, app) in self.apps.iter_mut().enumerate() {
+                    for app in self.apps.iter_mut(){
                         if (install_only && app.installed) || (!install_only && !app.installed) {
-                            app.render(ui, index as i8, &self.theme, &self.download_progress, &mut self.notifications, &self.settings_sender, &self.settings_receiver, &mut self.settings);
+                            app.render(ui, &self.theme, &mut self.notifications, &mut self.settings);
+                            ui.add_space(10.);
                         }
                     }
                 });
@@ -258,7 +251,11 @@ impl OpenLightsManager {
 
                     ui.horizontal(|ui| {
                         ui.add_sized([100., 50.], egui::Label::new(RichText::new("Java Path: ").color(self.theme.text)));
-                        ui.add_sized([200., 50.], egui::Label::new(RichText::new(&self.settings.jvm_path).color(self.theme.text).text_style(notification_font())));
+                        egui::ScrollArea::horizontal()
+                            .max_width(200.)
+                            .show(ui, |ui| {
+                                ui.add_sized([200., 50.], egui::Label::new(RichText::new(&self.settings.jvm_path).color(self.theme.text).text_style(notification_font())));
+                            });
                         if ui.add_sized([50., 30.], egui::Button::new(RichText::new("Locate").color(self.theme.text))).clicked() {
                             self.file_explorer.open();
                         }
@@ -442,11 +439,27 @@ impl Theme {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug)]
+pub struct ThreadCommunication {
+    pub event_receiver: Receiver<(AppEvents, Option<String>)>,
+    pub event_sender: Sender<(AppEvents, Option<String>)>,
+}
+
+impl Default for ThreadCommunication {
+    fn default() -> Self {
+        let (event_sender, event_receiver) = mpsc::channel();
+        ThreadCommunication {
+            event_sender,
+            event_receiver,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct App {
     pub installed: bool,
     #[serde(skip)]
-    pub event: InstallationEvents,
+    pub event: AppEvents,
     pub(crate) name: String,
     pub path: String, // This is the app_data path
     pub app_path: String, // This is the executable path
@@ -457,6 +470,12 @@ pub struct App {
     pub(crate) release_data: ReleaseData,
     pub has_update: bool,
     pub(crate) launchable: bool,
+    #[serde(skip)]
+    pub progress: Arc<AtomicI8>,
+    #[serde(skip)]
+    pub thread_communication: ThreadCommunication,
+    #[serde(skip)]
+    pub process: Arc<AtomicU32>,
 }
 
 impl App {
@@ -473,7 +492,7 @@ impl App {
     ) -> Self {
         App {
             installed: false,
-            event: InstallationEvents::default(),
+            event: AppEvents::default(),
             name,
             path,
             app_path: String::new(),
@@ -484,45 +503,50 @@ impl App {
             release_data,
             has_update,
             launchable,
+            progress: Arc::new(AtomicI8::new(0)),
+            thread_communication: ThreadCommunication::default(),
+            process: Arc::new(AtomicU32::new(0)),
         }
     }
 }
 
 impl App {
-    pub fn render(&mut self, ui: &mut Ui, index: i8, theme: &Theme, progress: &Arc<AtomicI8>, notifications: &mut VecDeque<Notification>, sender: &Sender<(InstallationEvents, Option<String>)>, receiver: &Receiver<(InstallationEvents, Option<String>)>, settings: &mut Settings) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(&mut self, ui: &mut Ui, theme: &Theme, notifications: &mut VecDeque<Notification>, settings: &mut Settings) {
 
-        if let Ok(event) = receiver.try_recv() {
+        if let Ok(event) = self.thread_communication.event_receiver.try_recv() {
             match event.0 {
-                InstallationEvents::Failed => {
-                    self.event = InstallationEvents::None;
+                AppEvents::Failed => {
+                    self.event = AppEvents::None;
                     let notification = app_installation_failure(&self.name);
                     notify(ui.ctx(), notification, notifications);
                 }
-                InstallationEvents::JavaInstalled => {
+                AppEvents::JavaInstalled => {
                     println!("Java Installed!");
-                    let path_str = event.1.unwrap();
+                    let path_str = format!("openlightsmanager/apps/{}/{}", self.name, event.1.unwrap());
                     let path = Path::new(&path_str);
-                    let full_path_str = path.to_string_lossy().to_string();
+                    let full_path = fs::canonicalize(path).unwrap();
+                    let full_path_str = full_path.to_string_lossy().to_string();
                     settings.jvm_path = full_path_str;
                     settings.save_settings();
                     self.installed = true;
-                    self.event = InstallationEvents::None;
+                    self.event = AppEvents::None;
                     save_app_data_offline(self);
                     let notification = app_installation_success(&self.name);
                     notify(ui.ctx(), notification, notifications);
                 }
-                InstallationEvents::ManagerInstalled => {
+                AppEvents::ManagerInstalled => {
                     println!("Manager Installed!");
                     self.installed = true;
-                    self.event = InstallationEvents::None;
+                    self.event = AppEvents::None;
                     save_app_data_offline(self);
                     let notification = manager_installation_success();
                     notify(ui.ctx(), notification, notifications);
                 }
-                InstallationEvents::AppInstalled => {
+                AppEvents::AppInstalled => {
                     println!("App Installed!");
                     self.installed = true;
-                    self.event = InstallationEvents::None;
+                    self.event = AppEvents::None;
                     save_app_data_offline(self);
                     let notification = app_installation_success(&self.name);
                     notify(ui.ctx(), notification, notifications);
@@ -533,90 +557,140 @@ impl App {
             }
         }
 
-        let img_rect = Rect::from_two_pos(pos2(30., (100 * index) as f32 + 160.), pos2(130., (100 * index) as f32 + 260.));
-        app_image(&self.name, ui, img_rect);
+        let installation_data = get_installation_data(&self);
+        ui.allocate_ui(Vec2::from([550., 140.]), |ui| {
+            ui.horizontal(|ui| {
+                // Image
+                let image = app_image(&self.name);
+                ui.add_sized([100., 100.], image);
 
-        let name_rect = Rect::from_two_pos(pos2(140., (100 * index) as f32 + 170.), pos2(460., (100 * index) as f32 + 210.));
-        ui.put(name_rect, egui::Label::new(RichText::new(&self.name).color(theme.text).strong()));
+                let installing = self.event == AppEvents::Downloading || self.event == AppEvents::Extracting;
+                ui.vertical(|ui| {
+                   ui.horizontal(|ui| {
+                       let name = if self.installed {
+                           format!("{} {}", &self.name, &self.version)
+                       } else {
+                           self.name.clone()
+                       };
+                       // Name
+                       ui.add_sized([320., 40.], egui::Label::new(RichText::new(name).color(theme.text).strong()));
 
-        let button_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 170.), pos2(570., (100 * index) as f32 + 210.));
+                       // Action Button
+                       let action_button_text = if self.installed {
+                           match self.event {
+                               AppEvents::Running => "Kill".to_string(),
+                               _ => "Launch".to_string(),
+                           }
+                       } else {
+                           match self.event {
+                               AppEvents::Downloading => "Downloading".to_string(),
+                               AppEvents::Extracting => "Extracting".to_string(),
+                               _ => "Install".to_string(),
+                           }
+                       };
 
-        if !&self.installed {
-            let progress_bar_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 215.), pos2(570., (100 * index) as f32 + 245.));
-            let prgs = progress.load(Ordering::Relaxed);
-            let mut installing = false;
-            let action_button_text = match self.event {
-                InstallationEvents::Downloading => {
-                    ui.ctx().request_repaint_after(Duration::from_millis(10));
-                    ui.put(progress_bar_rect, ProgressBar::new(prgs as f32 / 100.));
-                    installing = true;
-                    "Downloading".to_string()
-                }
-                InstallationEvents::Extracting => {
-                    ui.ctx().request_repaint_after(Duration::from_millis(10));
-                    ui.put(progress_bar_rect, ProgressBar::new(prgs as f32 / 100.));
-                    installing = true;
-                    "Extracting".to_string()
-                }
-                _ => {
-                    "Install".to_string()
-                }
-            };
+                       if self.installed && self.has_update {
+                           if installation_data.launchable && ui.add_sized([50., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
+                               let notification = launch_application(self, &settings.jvm_path);
+                               notify(ui.ctx(), notification, notifications);
+                           }
 
-            ui.add_enabled_ui(!installing, |ui| {
-                if ui.put(button_rect, egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
-                    self.event = InstallationEvents::Downloading;
-                    let cloned_sender = sender.clone();
-                    download_application(self, progress, cloned_sender);
-                }
+                           if ui.add_sized([50., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
+                               // TODO Update
+                           }
+                       } else {
+                           ui.add_enabled_ui(!installing, |ui| {
+                               if (installation_data.launchable && self.installed) && ui.add_sized([100., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
+                                   if self.installed {
+                                       let notification = launch_application(self, &settings.jvm_path);
+                                       notify(ui.ctx(), notification, notifications);
+                                   } else {
+                                       self.event = AppEvents::Downloading;
+                                       download_application(self, &self.progress, self.thread_communication.event_sender.clone());
+                                   }
+                               }
+                           });
+                       }
+                   });
+                   ui.horizontal(|ui| {
+                       // Description
+                       ui.add_sized([320., 40.], egui::Label::new(RichText::new(&self.github_data.description).color(theme.text).text_style(notification_font())));
+
+                       // Action Button / Progress Bar
+                       if !installing {
+                           if self.installed {
+                               if ui.add_sized([100., 40.], egui::Button::new(RichText::new("Uninstall").color(theme.text)).fill(theme.button)).clicked() {
+                                   let path_str = format!("openlightsmanager/apps/{}/", self.name);
+                                   let path = Path::new(&path_str);
+                                   let executable_path_str = get_full_path_str(&self.name, &installation_data.app_path);
+                                   if path.exists() {
+                                       fs::remove_dir_all(path).unwrap();
+                                       if executable_path_str == settings.jvm_path {
+                                           settings.jvm_path.clear();
+                                           settings.save_settings();
+                                       }
+                                   }
+                                   self.installed = false;
+                                   save_app_data_offline(&self);
+                               }
+                           }
+                       } else {
+                           let prgs = self.progress.load(Ordering::Relaxed);
+                           ui.ctx().request_repaint_after(Duration::from_millis(10));
+                           ui.add_sized([100., 30.], ProgressBar::new(prgs as f32 / 100.));
+                       }
+                   });
+                });
             });
-        }
-
-        let description_rect = Rect::from_two_pos(pos2(140., (100 * index) as f32 + 220.), pos2(460., (100 * index) as f32 + 260.));
-        ui.put(description_rect, egui::Label::new(RichText::new(&self.github_data.description).color(theme.text).text_style(notification_font())));
-
-        if self.installed {
-            if self.has_update {
-                if ui.put(button_rect, egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
-                    // TODO Update
-                }
-            }
-
-            let ver_rect = Rect::from_two_pos(pos2(470., (100 * index) as f32 + 220.), pos2(570., (100 * index) as f32 + 260.));
-            ui.put(ver_rect, egui::Label::new(&self.version.to_string()));
-        }
+        });
     }
 }
 
-fn app_image(name: &String, ui: &mut Ui, img_rect: Rect) {
+fn get_full_path_str(name: &String, executable: &String) -> String {
+    let path_str = format!("openlightsmanager/apps/{}{}", name, executable);
+    let path = Path::new(&path_str);
+    let full_path = fs::canonicalize(path).unwrap();
+    full_path.to_string_lossy().to_string()
+}
+
+fn app_image(name: &String) -> Image<'_> {
     match name.as_str() {
         "OpenLightsCore" => {
             Image::new(egui::include_image!("../assets/OpenLightsCore.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
-                .paint_at(ui, img_rect);
         },
         "OpenLightsManager" => {
             Image::new(egui::include_image!("../assets/OpenLightsManager.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
-                .paint_at(ui, img_rect);
         },
         "BeatMaker" => {
             Image::new(egui::include_image!("../assets/BeatMaker.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
-                .paint_at(ui, img_rect);
+
         },
         "graalvm-ce-builds" => {
             Image::new(egui::include_image!("../assets/graalvm-ce-builds.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
-                .paint_at(ui, img_rect);
+        },
+        "BeatFileEditor" => {
+            Image::new(egui::include_image!("../assets/BeatFileEditor.png"))
+                .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+        },
+        "Christmas-Jukebox" => {
+            Image::new(egui::include_image!("../assets/Christmas-Jukebox.png"))
+                .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+        },
+        _ => {
+            Image::new(egui::include_image!("../assets/Unknown.png"))
+                .fit_to_exact_size(Vec2 {x: 100., y: 100.})
         }
-        _ => {}
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GithubData {
     pub(crate) description: String,
+    pub archived: bool,
     pub(crate) releases_url: String,
 }
 

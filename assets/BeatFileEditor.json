@@ -1,0 +1,10 @@
+{
+    "launchable": true,
+    "launch_cmd": "{jvm} -jar {app}",
+    "is_library": false,
+    "is_manager": false,
+    "has_extra_folder": false,
+    "extension": "jar",
+    "key_word": "",
+    "app_path": "/BeatFileEditor.jar"
+}

@@ -2,9 +2,11 @@ use std::{fs, io, thread};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
+
 use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::header;
@@ -12,11 +14,12 @@ use semver::{Version, VersionReq};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 use zip::ZipArchive;
-use crate::gui::{App, GithubData, Notification};
-use crate::notifications::rate_limit_notification;
+
+use crate::gui::{App, GithubData, Notification, ThreadCommunication};
+use crate::notifications::{launched_application, launched_application_missing_java, rate_limit_notification};
 use crate::settings::Settings;
 
-const GITHUB_REPOS: [&str; 4] = ["Open-Lights/OpenLightsCore", "Open-Lights/OpenLightsManager", "Open-Lights/BeatMaker", "graalvm/graalvm-ce-builds"];
+const GITHUB_REPOS: [&str; 6] = ["Open-Lights/OpenLightsCore", "Open-Lights/OpenLightsManager", "Open-Lights/BeatMaker", "Open-Lights/Christmas-Jukebox", "Open-Lights/BeatFileEditor", "graalvm/graalvm-ce-builds"];
 
 pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, Option<Notification>) {
     let mut vector = Vec::new();
@@ -58,7 +61,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                 let version = parse_semver(&latest_data.1.tag_name);
                 let mut app = App {
                     installed: false,
-                    event: InstallationEvents::default(),
+                    event: AppEvents::default(),
                     path: path.to_string_lossy().to_string(),
                     app_path: String::new(),
                     name: project_name.to_string(),
@@ -69,11 +72,14 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     release_data: latest_data.1,
                     has_update: false,
                     launchable: false,
+                    progress: Arc::new(AtomicI8::new(0)),
+                    thread_communication: ThreadCommunication::default(),
+                    process: Arc::new(AtomicU32::new(0)),
                 };
                 let installation_data = get_installation_data(&app);
                 app.app_path = installation_data.app_path; //TODO Proper app path
                 app.launchable = installation_data.launchable;
-                save_app_data(app.clone(), prerelease, settings);
+                save_app_data(&mut app, prerelease, settings);
                 vector.push(app);
             }
         }
@@ -164,6 +170,7 @@ fn rate_limited_output() -> (GithubData, Option<crate::gui::ReleaseData>, Option
     // Rate Limited output
     let fake_github_data = GithubData {
         description: "Rate limited".to_string(),
+        archived: false,
         releases_url: "Unknown".to_string(),
     };
     let notification = rate_limit_notification();
@@ -182,14 +189,14 @@ async fn get_json(url: &String) -> String {
     resp.unwrap()
 }
 
-pub fn save_apps_data(apps: Vec<App>, prerelease: bool, settings: &mut Settings) {
-    for app in apps {
-        save_app_data(app, prerelease, settings);
+pub fn save_apps_data(mut apps: Vec<App>, prerelease: bool, settings: &mut Settings) {
+    for mut app in apps.iter_mut() {
+        save_app_data(&mut app, prerelease, settings);
     }
 }
 
-pub fn save_app_data(mut app: App, prerelease: bool, settings: &mut Settings) {
-    check_for_updates(&mut app, prerelease, settings, false);
+pub fn save_app_data(app: &mut App, prerelease: bool, settings: &mut Settings) {
+    check_for_updates(app, prerelease, settings, false);
     save_app_data_offline(&app);
 }
 
@@ -224,7 +231,7 @@ pub fn check_for_all_updates(apps: &mut Vec<App>, prerelease: bool, settings: &m
 
 // Override check avoids setting a new time
 pub fn check_for_updates(app: &mut App, prerelease: bool, settings: &mut Settings, override_check: bool) {
-    if should_check_github(settings) {
+    if !app.github_data.archived && should_check_github(settings) {
         let current_ver = &mut app.version;
         let latest_data = {
             let data = get_latest_version_data(&app.github_repo, !prerelease, true);
@@ -298,30 +305,30 @@ fn set_checked_for_update(settings: &mut Settings) {
 
 // File downloading
 // Extension includes the period
-pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sender<(InstallationEvents, Option<String>)>) {
-    let app_clone = app.clone();
+pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: Sender<(AppEvents, Option<String>)>) {
+    let installation_data = get_installation_data(&app);
+    let release_data = app.release_data.clone();
+    let name = app.name.clone();
     let progress_clone = Arc::clone(&progress);
     thread::spawn(move || {
         let application_path = Path::new("openlightsmanager/apps/");
         if !application_path.exists() {
             fs::create_dir_all(application_path).unwrap();
         }
-        for asset in &app_clone.release_data.assets {
+        for asset in &release_data.assets {
             let filename = asset.browser_download_url.split('/').last().unwrap_or("unknown");
             println!("Examining {}", filename);
             let parts: Vec<&str> = filename.split('.').collect();
             let asset_extension = parts.last().unwrap_or(&"").to_string();
 
-            let installation_data = get_installation_data(&app_clone);
-
-            if let Some(extension_comparing) = installation_data.extension {
-                if asset_extension.ne(&extension_comparing) {
+            if let Some(extension_comparing) = &installation_data.extension {
+                if asset_extension.ne(extension_comparing) {
                     println!("Bad: extension mismatch; Provided {}, Expected {}", asset_extension, extension_comparing);
                     continue;
                 }
             }
 
-            if let Some(key) = installation_data.key_word {
+            if let Some(key) = &installation_data.key_word {
                 if !filename.contains(key.as_str()) {
                     println!("Bad: key word mismatch");
                     continue;
@@ -332,7 +339,7 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sen
             let path_str = if is_archive(&asset_extension) {
                 format!("openlightsmanager/apps/{}", filename)
             } else {
-                let parent_str =   format!("openlightsmanager/apps/{}/", &app_clone.name);
+                let parent_str =   format!("openlightsmanager/apps/{}/", name);
                 let parent_path = Path::new(&parent_str);
                 if !parent_path.exists() {
                     fs::create_dir_all(parent_path).unwrap();
@@ -343,13 +350,13 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sen
             rt.block_on(get_file(&asset.browser_download_url, path_str.clone(), &progress_clone));
 
             if is_archive(&asset_extension) {
-                send_event(&sender, InstallationEvents::Extracting, None);
+                send_event(&sender, AppEvents::Extracting, None);
                 progress_clone.store(0, Ordering::Relaxed);
 
                 let extracted_path_str = if installation_data.has_extra_folder {
                     String::from("openlightsmanager/apps/")
                 } else {
-                    format!("openlightsmanager/apps/{}/", &app_clone.name)
+                    format!("openlightsmanager/apps/{}/", name)
                 };
                 let extracted_path = Path::new(&extracted_path_str);
                 if !extracted_path.exists() {
@@ -388,8 +395,8 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sen
                     for entry in extracted_path.read_dir().expect("Failed to read directory") {
                         if let Ok(entry) = entry {
                             let entry_path = entry.path();
-                            if entry_path.is_dir() {
-                                let new_entry_path_str = format!("openlightsmanager/apps/{}/", &app_clone.name);
+                            if entry_path.is_dir() && entry_path.file_name().unwrap().to_string_lossy().contains(&installation_data.extra_folder_key_word.clone().unwrap().as_str()) {
+                                let new_entry_path_str = format!("openlightsmanager/apps/{}/", name);
                                 let new_entry_path = Path::new(&new_entry_path_str);
                                 fs::rename(entry_path, new_entry_path).unwrap();
                             }
@@ -402,19 +409,19 @@ pub fn download_application(app: &mut App, progress: &Arc<AtomicI8>, sender: Sen
 
             // Is Java
             if installation_data.is_library && filename.contains("jdk") {
-                send_event(&sender, InstallationEvents::JavaInstalled, Some(installation_data.app_path));
+                send_event(&sender, AppEvents::JavaInstalled, Some(installation_data.app_path));
             } else if installation_data.is_manager {
                 // TODO Remove old exe
-                send_event(&sender, InstallationEvents::ManagerInstalled, None);
+                send_event(&sender, AppEvents::ManagerInstalled, None);
             } else {
-                send_event(&sender, InstallationEvents::AppInstalled, None);
+                send_event(&sender, AppEvents::AppInstalled, None);
             }
             progress_clone.store(0, Ordering::Relaxed);
             println!("Finished Installing!");
             return;
         }
         println!("Failed to install");
-        send_event(&sender, InstallationEvents::Failed, None); // TODO Send failure message
+        send_event(&sender, AppEvents::Failed, None); // TODO Send failure message
         progress_clone.store(0, Ordering::Relaxed);
     });
 }
@@ -449,28 +456,61 @@ fn is_archive(extension: &String) -> bool {
 }
 
 #[derive(Deserialize)]
-struct InstallationData {
-    launchable: bool,
+pub struct InstallationData {
+    pub launchable: bool,
+    launch_cmd: Option<String>, // Use {jvm} for java path; Use {app} for app path to executable
     is_library: bool,
     is_manager: bool,
     has_extra_folder: bool,
+    extra_folder_key_word: Option<String>,
     extension: Option<String>,
     key_word: Option<String>,
-    app_path: String,
+    pub app_path: String,
 }
 
-fn get_installation_data(app: &App) -> InstallationData {
+pub fn get_installation_data(app: &App) -> InstallationData {
     let path_str = format!("assets/{}.json", app.name);
     let path = Path::new(&path_str);
-    println!("InstallDataPath: {}", path_str);
     let file = File::open(path).unwrap();
     let mut reader = BufReader::new(file);
     let result: Result<InstallationData, serde_json::Error> = serde_json::from_reader(&mut reader);
     result.unwrap()
 }
 
+pub fn launch_application(app: &mut App, jvm_path_og: &String) -> Notification {
+    app.event = AppEvents::Running;
+    let installation_data = get_installation_data(&app);
+    let app_name = app.name.clone();
+    let jvm_path = jvm_path_og.clone();
+    let id_clone = Arc::clone(&app.process);
+    let cmd = installation_data.launch_cmd.unwrap_or(format!("{}{}", app_name, installation_data.app_path));
+    if cmd.contains("{jvm}") && jvm_path.is_empty() {
+        return launched_application_missing_java(&app_name);
+    }
+
+    thread::spawn(move || {
+        let main_argument_path = if cmd.contains("{jvm}") {
+            Path::new(&jvm_path)
+        } else {
+            Path::new(&cmd)
+        };
+        let app_path = format!("openlightsmanager/apps/{}/", app_name);
+        let dir = Path::new(app_path.as_str());
+        let filled_in = cmd.replace("{jvm} ", "").replace("{app}", installation_data.app_path.replace("/", "").as_str());
+        let split: Vec<&str> = filled_in.split_whitespace().collect();
+        id_clone.store(Command::new(main_argument_path)
+                           .current_dir(dir)
+                           .args(split)
+                           .spawn()
+                           .expect("Failed to run application")
+                           .id(), Ordering::Relaxed);
+    });
+
+    launched_application(&app.name)
+}
+
 #[derive(Default, Clone, Debug, PartialEq)]
-pub enum InstallationEvents {
+pub enum AppEvents {
     #[default]
     None,
     Downloading,
@@ -479,8 +519,9 @@ pub enum InstallationEvents {
     Failed,
     JavaInstalled,
     ManagerInstalled,
+    Running,
 }
 
-fn send_event(sender: &Sender<(InstallationEvents, Option<String>)>, event: InstallationEvents, data: Option<String>) {
+fn send_event(sender: &Sender<(AppEvents, Option<String>)>, event: AppEvents, data: Option<String>) {
     sender.send((event, data)).unwrap();
 }

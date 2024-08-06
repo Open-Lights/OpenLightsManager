@@ -3,6 +3,7 @@
     "is_library": true,
     "is_manager": false,
     "has_extra_folder": true,
+    "extra_folder_key_word": "graalvm",
     "extension": "zip",
     "key_word": "windows",
     "app_path": "/bin/javaw.exe"
