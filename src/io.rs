@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokio::runtime::Runtime;
 use zip::ZipArchive;
 
-use crate::gui::{App, GithubData, Notification, ThreadCommunication};
+use crate::gui::{App, GithubData, Notification, ReleaseData, ThreadCommunication};
 use crate::notifications::{launched_application, launched_application_missing_java, rate_limit_notification};
 use crate::settings::Settings;
 
@@ -71,6 +71,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     github_data: latest_data.0,
                     release_data: latest_data.1,
                     has_update: false,
+                    update_download_url: None,
                     launchable: false,
                     progress: Arc::new(AtomicI8::new(0)),
                     thread_communication: ThreadCommunication::default(),
@@ -244,6 +245,10 @@ pub fn check_for_updates(app: &mut App, prerelease: bool, settings: &mut Setting
         let latest_ver = parse_semver(&latest_data.1.tag_name);
         if is_outdated(parse_semver(current_ver), latest_ver) {
             app.has_update = true;
+            let installation_data = get_installation_data(&app);
+            let download_url = locate_asset(&latest_data.1, &installation_data);
+            app.update_download_url = Some(download_url);
+            save_app_data_offline(&app);
         }
         if !override_check {
             set_checked_for_update(settings);
@@ -336,94 +341,130 @@ pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: Sender<
             }
 
             println!("Success");
-            let path_str = if is_archive(&asset_extension) {
-                format!("openlightsmanager/apps/{}", filename)
-            } else {
-                let parent_str =   format!("openlightsmanager/apps/{}/", name);
-                let parent_path = Path::new(&parent_str);
-                if !parent_path.exists() {
-                    fs::create_dir_all(parent_path).unwrap();
-                }
-                format!("{}{}", parent_str, filename)
-            };
-            let rt = Runtime::new().unwrap();
-            rt.block_on(get_file(&asset.browser_download_url, path_str.clone(), &progress_clone));
+            let path_str = download(&asset_extension, filename, &name, &progress_clone, &asset.browser_download_url);
 
-            if is_archive(&asset_extension) {
-                send_event(&sender, AppEvents::Extracting, None);
-                progress_clone.store(0, Ordering::Relaxed);
+            extract(&asset_extension, &sender, &progress_clone, &installation_data, &name, &path_str);
 
-                let extracted_path_str = if installation_data.has_extra_folder {
-                    String::from("openlightsmanager/apps/")
-                } else {
-                    format!("openlightsmanager/apps/{}/", name)
-                };
-                let extracted_path = Path::new(&extracted_path_str);
-                if !extracted_path.exists() {
-                    fs::create_dir(extracted_path).unwrap();
-                }
-                let path = Path::new(&path_str);
-                let file = File::open(path).unwrap();
-                let mut archive = ZipArchive::new(file).unwrap();
-
-                let total_files = archive.len();
-                for i in 0..total_files {
-                    let mut file = archive.by_index(i).unwrap();
-                    #[allow(deprecated)]
-                    let file_name = file.sanitized_name();
-                    let extracted_file_path = extracted_path.join(file_name);
-
-                    if file.is_dir() {
-                        fs::create_dir_all(&extracted_file_path).unwrap();
-                    } else {
-                        let parent = extracted_file_path.parent().unwrap();
-                        if !parent.exists() {
-                            fs::create_dir_all(parent).unwrap();
-                        }
-                        let mut extracted_file = File::create(&extracted_file_path).unwrap();
-                        io::copy(&mut file, &mut extracted_file).unwrap();
-                    }
-
-                    let progress = ((i as f32 + 1.) * 100.) / total_files as f32;
-                    let progress_rounded = progress.ceil() as i8;
-                    progress_clone.store(progress_rounded, Ordering::Relaxed);
-                }
-
-                // App-specific tasks
-
-                if installation_data.has_extra_folder {
-                    for entry in extracted_path.read_dir().expect("Failed to read directory") {
-                        if let Ok(entry) = entry {
-                            let entry_path = entry.path();
-                            if entry_path.is_dir() && entry_path.file_name().unwrap().to_string_lossy().contains(&installation_data.extra_folder_key_word.clone().unwrap().as_str()) {
-                                let new_entry_path_str = format!("openlightsmanager/apps/{}/", name);
-                                let new_entry_path = Path::new(&new_entry_path_str);
-                                fs::rename(entry_path, new_entry_path).unwrap();
-                            }
-                        }
-                    }
-                }
-
-                fs::remove_file(path).unwrap();
-            }
-
-            // Is Java
-            if installation_data.is_library && filename.contains("jdk") {
-                send_event(&sender, AppEvents::JavaInstalled, Some(installation_data.app_path));
-            } else if installation_data.is_manager {
-                // TODO Remove old exe
-                send_event(&sender, AppEvents::ManagerInstalled, None);
-            } else {
-                send_event(&sender, AppEvents::AppInstalled, None);
-            }
-            progress_clone.store(0, Ordering::Relaxed);
-            println!("Finished Installing!");
+            finalize_download(&installation_data, &sender, filename, &progress_clone);
             return;
         }
         println!("Failed to install");
         send_event(&sender, AppEvents::Failed, None); // TODO Send failure message
         progress_clone.store(0, Ordering::Relaxed);
     });
+}
+
+fn download(asset_extension: &String, filename: &str, name: &String, progress_clone: &Arc<AtomicI8>, download_url: &String) -> String {
+    let path_str = if is_archive(&asset_extension) {
+        format!("openlightsmanager/apps/{}", filename)
+    } else {
+        let parent_str =   format!("openlightsmanager/apps/{}/", name);
+        let parent_path = Path::new(&parent_str);
+        if !parent_path.exists() {
+            fs::create_dir_all(parent_path).unwrap();
+        }
+        format!("{}{}", parent_str, filename)
+    };
+    let rt = Runtime::new().unwrap();
+    rt.block_on(get_file(download_url, path_str.clone(), &progress_clone));
+    path_str
+}
+
+fn extract(asset_extension: &String, sender: &Sender<(AppEvents, Option<String>)>, progress_clone: &Arc<AtomicI8>, installation_data: &InstallationData, name: &String, path_str: &String) {
+    if is_archive(&asset_extension) {
+        send_event(&sender, AppEvents::Extracting, None);
+        progress_clone.store(0, Ordering::Relaxed);
+
+        let extracted_path_str = if installation_data.has_extra_folder {
+            String::from("openlightsmanager/apps/")
+        } else {
+            format!("openlightsmanager/apps/{}/", name)
+        };
+        let extracted_path = Path::new(&extracted_path_str);
+        if !extracted_path.exists() {
+            fs::create_dir(extracted_path).unwrap();
+        }
+        let path = Path::new(&path_str);
+        let file = File::open(path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+
+        let total_files = archive.len();
+        for i in 0..total_files {
+            let mut file = archive.by_index(i).unwrap();
+            #[allow(deprecated)]
+            let file_name = file.sanitized_name();
+            let extracted_file_path = extracted_path.join(file_name);
+
+            if file.is_dir() {
+                fs::create_dir_all(&extracted_file_path).unwrap();
+            } else {
+                let parent = extracted_file_path.parent().unwrap();
+                if !parent.exists() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                let mut extracted_file = File::create(&extracted_file_path).unwrap();
+                io::copy(&mut file, &mut extracted_file).unwrap();
+            }
+
+            let progress = ((i as f32 + 1.) * 100.) / total_files as f32;
+            let progress_rounded = progress.ceil() as i8;
+            progress_clone.store(progress_rounded, Ordering::Relaxed);
+        }
+
+        // App-specific tasks
+
+        if installation_data.has_extra_folder {
+            for entry in extracted_path.read_dir().expect("Failed to read directory") {
+                if let Ok(entry) = entry {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() && entry_path.file_name().unwrap().to_string_lossy().contains(&installation_data.extra_folder_key_word.clone().unwrap().as_str()) {
+                        let new_entry_path_str = format!("openlightsmanager/apps/{}/", name);
+                        let new_entry_path = Path::new(&new_entry_path_str);
+                        fs::rename(entry_path, new_entry_path).unwrap();
+                    }
+                }
+            }
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+}
+
+fn finalize_download(installation_data: &InstallationData, sender: &Sender<(AppEvents, Option<String>)>, filename: &str, progress_clone: &Arc<AtomicI8>) {
+    // Is Java
+    if installation_data.is_library && filename.contains("jdk") {
+        send_event(&sender, AppEvents::JavaInstalled, Some(installation_data.app_path.clone()));
+    } else if installation_data.is_manager {
+        // TODO Remove old exe
+        send_event(&sender, AppEvents::ManagerInstalled, None);
+    } else {
+        send_event(&sender, AppEvents::AppInstalled, None);
+    }
+    progress_clone.store(0, Ordering::Relaxed);
+    println!("Finished Installing!");
+}
+
+fn locate_asset(release_data: &ReleaseData, installation_data: &InstallationData) -> String {
+    for asset in &release_data.assets {
+        let filename = asset.browser_download_url.split('/').last().unwrap_or("unknown");
+        let parts: Vec<&str> = filename.split('.').collect();
+        let asset_extension = parts.last().unwrap_or(&"").to_string();
+
+        if let Some(extension_comparing) = &installation_data.extension {
+            if asset_extension.ne(extension_comparing) {
+                continue;
+            }
+        }
+
+        if let Some(key) = &installation_data.key_word {
+            if !filename.contains(key.as_str()) {
+                continue;
+            }
+        }
+
+        return asset.browser_download_url.clone();
+    }
+    String::new()
 }
 
 async fn get_file(url: &String, path: String, progress: &Arc<AtomicI8>) {
@@ -442,6 +483,42 @@ async fn get_file(url: &String, path: String, progress: &Arc<AtomicI8>) {
         let progress_percentage = ((total_bytes_read * 100) as f64 / content_length as f64).round() as i8;
         progress.store(progress_percentage, Ordering::Relaxed);
     }
+}
+
+pub fn update(app: &App, progress: &Arc<AtomicI8>, sender: Sender<(AppEvents, Option<String>)>) {
+    let download_url = app.update_download_url.unwrap();
+    let installation_data = get_installation_data(&app);
+    let filename = download_url.split('/').last().unwrap_or("unknown");
+    let parts: Vec<&str> = filename.split('.').collect();
+    let asset_extension = parts.last().unwrap_or(&"").to_string();
+    let name = app.name.clone();
+    let progress_clone = Arc::clone(&progress);
+    thread::spawn(move || {
+        // Clear old files
+        if is_archive(&asset_extension) {
+            // None of my apps would come in archive form, so it's safe to delete the entire thing
+            let path_str = format!("openlightsmanager/apps/{}", &app.name);
+            let path = Path::new(&path_str);
+
+            if path.exists() {
+                fs::remove_dir_all(path).unwrap();
+            }
+        } else {
+            let path_str = format!("openlightsmanager/apps/{}/{}", &app.name, &filename);
+            let path = Path::new(&path_str);
+
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+
+        // Download new version
+        let path_str = download(&asset_extension, filename, &name, &progress_clone, &download_url);
+
+        extract(&asset_extension, &sender, &progress_clone, &installation_data, &name, &path_str);
+
+        finalize_download(&installation_data, &sender, filename, &progress_clone);
+    });
 }
 
 fn is_archive(extension: &String) -> bool {

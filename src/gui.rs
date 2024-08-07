@@ -14,7 +14,7 @@ use egui::TextStyle::Body;
 use egui_file::FileDialog;
 use serde::{Deserialize, Serialize};
 
-use crate::io::{AppEvents, check_for_all_updates, download_application, gather_app_data, get_installation_data, launch_application, save_app_data_offline, should_check_github};
+use crate::io::{AppEvents, check_for_all_updates, download_application, gather_app_data, get_installation_data, launch_application, save_app_data_offline, should_check_github, update};
 use crate::notifications::{app_installation_failure, app_installation_success, java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, manager_installation_success, rate_limit_notification};
 use crate::settings::{load_settings, Settings};
 
@@ -469,6 +469,7 @@ pub struct App {
     pub(crate) github_data: GithubData,
     pub(crate) release_data: ReleaseData,
     pub has_update: bool,
+    pub update_download_url: Option<String>,
     pub(crate) launchable: bool,
     #[serde(skip)]
     pub progress: Arc<AtomicI8>,
@@ -502,6 +503,7 @@ impl App {
             github_data,
             release_data,
             has_update,
+            update_download_url: None,
             launchable,
             progress: Arc::new(AtomicI8::new(0)),
             thread_communication: ThreadCommunication::default(),
@@ -546,6 +548,7 @@ impl App {
                 AppEvents::AppInstalled => {
                     println!("App Installed!");
                     self.installed = true;
+                    self.has_update = false;
                     self.event = AppEvents::None;
                     save_app_data_offline(self);
                     let notification = app_installation_success(&self.name);
@@ -590,14 +593,17 @@ impl App {
                        };
 
                        if self.installed && self.has_update {
-                           if installation_data.launchable && ui.add_sized([50., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
-                               let notification = launch_application(self, &settings.jvm_path);
-                               notify(ui.ctx(), notification, notifications);
-                           }
+                           ui.add_enabled_ui(!installing, |ui| {
+                               if installation_data.launchable && ui.add_sized([50., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
+                                   let notification = launch_application(self, &settings.jvm_path);
+                                   notify(ui.ctx(), notification, notifications);
+                               }
 
-                           if ui.add_sized([50., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
-                               // TODO Update
-                           }
+                               if ui.add_sized([50., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
+                                   // TODO Update
+                                   update(&self, &self.progress, self.thread_communication.event_sender.clone());
+                               }
+                           });
                        } else {
                            ui.add_enabled_ui(!installing, |ui| {
                                if (installation_data.launchable && self.installed) && ui.add_sized([100., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
