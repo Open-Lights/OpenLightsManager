@@ -442,14 +442,14 @@ impl Theme {
 #[derive(Debug)]
 pub struct ThreadCommunication {
     pub event_receiver: Receiver<(AppEvents, Option<String>)>,
-    pub event_sender: Sender<(AppEvents, Option<String>)>,
+    pub event_sender: Arc<Sender<(AppEvents, Option<String>)>>,
 }
 
 impl Default for ThreadCommunication {
     fn default() -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         ThreadCommunication {
-            event_sender,
+            event_sender: Arc::new(event_sender),
             event_receiver,
         }
     }
@@ -601,7 +601,7 @@ impl App {
 
                                if ui.add_sized([50., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
                                    // TODO Update
-                                   update(&self, &self.progress, self.thread_communication.event_sender.clone());
+                                   update(&self, &self.progress, &self.thread_communication.event_sender);
                                }
                            });
                        } else {
@@ -612,7 +612,7 @@ impl App {
                                        notify(ui.ctx(), notification, notifications);
                                    } else {
                                        self.event = AppEvents::Downloading;
-                                       download_application(self, &self.progress, self.thread_communication.event_sender.clone());
+                                       download_application(self, &self.progress, &self.thread_communication.event_sender);
                                    }
                                }
                            });

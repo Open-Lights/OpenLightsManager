@@ -310,11 +310,12 @@ fn set_checked_for_update(settings: &mut Settings) {
 
 // File downloading
 // Extension includes the period
-pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: Sender<(AppEvents, Option<String>)>) {
+pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Sender<(AppEvents, Option<String>)>>) {
     let installation_data = get_installation_data(&app);
     let release_data = app.release_data.clone();
     let name = app.name.clone();
     let progress_clone = Arc::clone(&progress);
+    let sender_clone = Arc::clone(sender);
     thread::spawn(move || {
         let application_path = Path::new("openlightsmanager/apps/");
         if !application_path.exists() {
@@ -343,13 +344,13 @@ pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: Sender<
             println!("Success");
             let path_str = download(&asset_extension, filename, &name, &progress_clone, &asset.browser_download_url);
 
-            extract(&asset_extension, &sender, &progress_clone, &installation_data, &name, &path_str);
+            extract(&asset_extension, &sender_clone, &progress_clone, &installation_data, &name, &path_str);
 
-            finalize_download(&installation_data, &sender, filename, &progress_clone);
+            finalize_download(&installation_data, &sender_clone, filename, &progress_clone);
             return;
         }
         println!("Failed to install");
-        send_event(&sender, AppEvents::Failed, None); // TODO Send failure message
+        send_event(&sender_clone, AppEvents::Failed, None); // TODO Send failure message
         progress_clone.store(0, Ordering::Relaxed);
     });
 }
@@ -485,26 +486,27 @@ async fn get_file(url: &String, path: String, progress: &Arc<AtomicI8>) {
     }
 }
 
-pub fn update(app: &App, progress: &Arc<AtomicI8>, sender: Sender<(AppEvents, Option<String>)>) {
-    let download_url = app.update_download_url.unwrap();
+pub fn update(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Sender<(AppEvents, Option<String>)>>) {
+    let download_url = <Option<String> as Clone>::clone(&app.update_download_url).unwrap();
     let installation_data = get_installation_data(&app);
-    let filename = download_url.split('/').last().unwrap_or("unknown");
+    let filename = download_url.split('/').last().clone().unwrap_or("unknown").to_string();
     let parts: Vec<&str> = filename.split('.').collect();
     let asset_extension = parts.last().unwrap_or(&"").to_string();
     let name = app.name.clone();
     let progress_clone = Arc::clone(&progress);
+    let sender_clone = Arc::clone(sender);
     thread::spawn(move || {
         // Clear old files
         if is_archive(&asset_extension) {
             // None of my apps would come in archive form, so it's safe to delete the entire thing
-            let path_str = format!("openlightsmanager/apps/{}", &app.name);
+            let path_str = format!("openlightsmanager/apps/{}", &name);
             let path = Path::new(&path_str);
 
             if path.exists() {
                 fs::remove_dir_all(path).unwrap();
             }
         } else {
-            let path_str = format!("openlightsmanager/apps/{}/{}", &app.name, &filename);
+            let path_str = format!("openlightsmanager/apps/{}/{}", &name, &filename);
             let path = Path::new(&path_str);
 
             if path.exists() {
@@ -513,11 +515,11 @@ pub fn update(app: &App, progress: &Arc<AtomicI8>, sender: Sender<(AppEvents, Op
         }
 
         // Download new version
-        let path_str = download(&asset_extension, filename, &name, &progress_clone, &download_url);
+        let path_str = download(&asset_extension, &filename, &name, &progress_clone, &download_url);
 
-        extract(&asset_extension, &sender, &progress_clone, &installation_data, &name, &path_str);
+        extract(&asset_extension, &sender_clone, &progress_clone, &installation_data, &name, &path_str);
 
-        finalize_download(&installation_data, &sender, filename, &progress_clone);
+        finalize_download(&installation_data, &sender_clone, &filename, &progress_clone);
     });
 }
 
