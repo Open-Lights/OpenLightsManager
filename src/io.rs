@@ -40,7 +40,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
             let reader = BufReader::new(file);
             let mut app: App = serde_json::from_reader(reader).unwrap();
             app.installation_data = get_installation_data(&app);
-            if &app.installation_data.is_manager {
+            if app.installation_data.is_manager {
                 app.installed = true;
                 // TODO Write the first manager json to file
             }
@@ -88,7 +88,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                 app.app_path = installation_data.app_path.clone();
                 app.launchable = installation_data.launchable;
                 app.installation_data = installation_data;
-                if &app.installation_data.is_manager {
+                if app.installation_data.is_manager {
                     app.installed = true;
                     // TODO Write the first manager json to file
                 }

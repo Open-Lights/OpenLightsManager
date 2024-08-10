@@ -30,6 +30,18 @@ jobs:
     - name: Building ${{ matrix.TARGET }}
       run: echo "${{ matrix.TARGET }}"
 
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v0-rust"
+        env-vars: "CARGO CC CFLAGS CXX CMAKE RUST"
+        workspaces: ". -> target"
+        cache-targets: "true"
+        cache-on-failure: "false"
+        cache-all-crates: "false"
+        save-if: "true"
+        cache-provider: "github"
+
     - uses: actions/checkout@master
     - name: Install build dependencies - Rustup
       run: |
@@ -48,17 +60,9 @@ jobs:
       run: |
         cargo install cross
 
-    - name: Cache Cargo
-      uses: Swatinem/rust-cache@v2
-      with:
-        prefix-key: "v0-rust"
-        env-vars: "CARGO CC CFLAGS CXX CMAKE RUST"
-        workspaces: ". -> target"
-        cache-targets: "true"
-        cache-on-failure: "false"
-        cache-all-crates: "false"
-        save-if: "true"
-        cache-provider: "github"
+    - name: Install libraries
+      if: contains(matrix.TARGET, 'linux')
+      run: sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
     - name: Build
       run: |
