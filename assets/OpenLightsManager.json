@@ -1,5 +1,5 @@
 {
-    "launchable": true,
+    "launchable": false,
     "is_library": false,
     "is_manager": true,
     "has_extra_folder": false,

@@ -21,7 +21,7 @@ use crate::settings::Settings;
 
 const GITHUB_REPOS: [&str; 6] = ["Open-Lights/OpenLightsCore", "Open-Lights/OpenLightsManager", "Open-Lights/BeatMaker", "Open-Lights/Christmas-Jukebox", "Open-Lights/BeatFileEditor", "graalvm/graalvm-ce-builds"];
 
-pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, Option<Notification>) {
+pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, Option<Notification>) { // TODO Fix an issue with prerelease being true and not loading stable releases
     let mut vector = Vec::new();
     let mut checked_github = false;
     for project_str in GITHUB_REPOS {
@@ -38,6 +38,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                 .unwrap();
             let reader = BufReader::new(file);
             let mut app: App = serde_json::from_reader(reader).unwrap();
+            app.installation_data = get_installation_data(&app);
             check_for_updates(&mut app, prerelease, settings, false);
             vector.push(app);
         } else {
@@ -76,11 +77,13 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     progress: Arc::new(AtomicI8::new(0)),
                     thread_communication: ThreadCommunication::default(),
                     process: Arc::new(AtomicU32::new(0)),
+                    installation_data: InstallationData::default(),
                 };
                 let installation_data = get_installation_data(&app);
-                app.app_path = installation_data.app_path; //TODO Proper app path
+                app.app_path = installation_data.app_path.clone(); //TODO Proper app path
                 app.launchable = installation_data.launchable;
-                save_app_data(&mut app, prerelease, settings);
+                app.installation_data = installation_data;
+                save_app_data_offline(&app);
                 vector.push(app);
             }
         }
@@ -93,7 +96,7 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
 
 // Strict means it must be stable if prefer_stable is true
 // If not strict and no stable builds are found, the latest unstable build is provided
-pub fn get_latest_version_data(project: &String, prefer_stable: bool, strict: bool) -> (GithubData, Option<crate::gui::ReleaseData>, Option<Notification>) {
+pub fn get_latest_version_data(project: &String, prefer_stable: bool, strict: bool) -> (GithubData, Option<ReleaseData>, Option<Notification>) {
     let url = format!("https://api.github.com/repos/{}", project);
     println!("{}", &url);
     let rt = Runtime::new().unwrap();
@@ -104,7 +107,7 @@ pub fn get_latest_version_data(project: &String, prefer_stable: bool, strict: bo
         let modified_repo_url = release_repo_url.replace("{/id}", "");
         let response_release = rt.block_on(get_json(&modified_repo_url));
         println!("{}", &modified_repo_url);
-        let release_response: Result<Vec<crate::gui::ReleaseData>, serde_json::Error> = serde_json::from_str(&response_release);
+        let release_response: Result<Vec<ReleaseData>, serde_json::Error> = serde_json::from_str(&response_release);
         if let Ok(release_data) = release_response {
             if !release_data.is_empty() {
                 if prefer_stable {
@@ -128,7 +131,7 @@ pub fn get_latest_version_data(project: &String, prefer_stable: bool, strict: bo
     rate_limited_output()
 }
 
-pub fn get_version_data(project: String, id: i32) -> (GithubData, Option<crate::gui::ReleaseData>, Option<Notification>) {
+pub fn get_version_data(project: String, id: i32) -> (GithubData, Option<ReleaseData>, Option<Notification>) {
     let url = format!("https://api.github.com/repos/{}", project);
     let rt = Runtime::new().unwrap();
     let response = rt.block_on(get_json(&url.to_owned()));
@@ -167,7 +170,7 @@ fn minutes_between_gh_checks(authed: bool) -> i64 {
     unrounded.ceil() as i64
 }
 
-fn rate_limited_output() -> (GithubData, Option<crate::gui::ReleaseData>, Option<Notification>) {
+fn rate_limited_output() -> (GithubData, Option<ReleaseData>, Option<Notification>) {
     // Rate Limited output
     let fake_github_data = GithubData {
         description: "Rate limited".to_string(),
@@ -233,6 +236,7 @@ pub fn check_for_all_updates(apps: &mut Vec<App>, prerelease: bool, settings: &m
 // Override check avoids setting a new time
 pub fn check_for_updates(app: &mut App, prerelease: bool, settings: &mut Settings, override_check: bool) {
     if !app.github_data.archived && should_check_github(settings) {
+        println!("CHECKING FOR UPDATES");
         let current_ver = &mut app.version;
         let latest_data = {
             let data = get_latest_version_data(&app.github_repo, !prerelease, true);
@@ -243,11 +247,13 @@ pub fn check_for_updates(app: &mut App, prerelease: bool, settings: &mut Setting
             }
         };
         let latest_ver = parse_semver(&latest_data.1.tag_name);
+        println!("Current Ver: {}, New Ver: {}", current_ver, latest_ver.to_string());
         if is_outdated(parse_semver(current_ver), latest_ver) {
             app.has_update = true;
             let installation_data = get_installation_data(&app);
             let download_url = locate_asset(&latest_data.1, &installation_data);
             app.update_download_url = Some(download_url);
+            app.release_data = latest_data.1;
             save_app_data_offline(&app);
         }
         if !override_check {
@@ -298,6 +304,7 @@ pub fn is_stable(version: Version) -> bool {
 pub fn is_outdated(current_ver: Version, other_ver: Version) -> bool {
     let version_1_str = current_ver.to_string();
     let req = VersionReq::parse(format!(">{}", &version_1_str).as_str()).unwrap();
+    println!("Is outdated (>{}): {}", &version_1_str, req.matches(&other_ver));
     req.matches(&other_ver)
 }
 
@@ -342,7 +349,7 @@ pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Se
             }
 
             println!("Success");
-            let path_str = download(&asset_extension, filename, &name, &progress_clone, &asset.browser_download_url);
+            let path_str = download(&asset_extension, filename, &name, &progress_clone, &asset.browser_download_url, &installation_data);
 
             extract(&asset_extension, &sender_clone, &progress_clone, &installation_data, &name, &path_str);
 
@@ -355,7 +362,7 @@ pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Se
     });
 }
 
-fn download(asset_extension: &String, filename: &str, name: &String, progress_clone: &Arc<AtomicI8>, download_url: &String) -> String {
+fn download(asset_extension: &String, filename: &str, name: &String, progress_clone: &Arc<AtomicI8>, download_url: &String, installation_data: &InstallationData) -> String {
     let path_str = if is_archive(&asset_extension) {
         format!("openlightsmanager/apps/{}", filename)
     } else {
@@ -368,6 +375,12 @@ fn download(asset_extension: &String, filename: &str, name: &String, progress_cl
     };
     let rt = Runtime::new().unwrap();
     rt.block_on(get_file(download_url, path_str.clone(), &progress_clone));
+    if installation_data.is_manager {
+        let original = Path::new(&path_str);
+        let new_str = path_str.replace(filename, format!("NEW-{}", filename).as_str());
+        let new_path = Path::new(&new_str);
+        fs::rename(original, new_path).unwrap();
+    }
     path_str
 }
 
@@ -436,7 +449,6 @@ fn finalize_download(installation_data: &InstallationData, sender: &Sender<(AppE
     if installation_data.is_library && filename.contains("jdk") {
         send_event(&sender, AppEvents::JavaInstalled, Some(installation_data.app_path.clone()));
     } else if installation_data.is_manager {
-        // TODO Remove old exe
         send_event(&sender, AppEvents::ManagerInstalled, None);
     } else {
         send_event(&sender, AppEvents::AppInstalled, None);
@@ -515,12 +527,19 @@ pub fn update(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Sender<(AppEvent
         }
 
         // Download new version
-        let path_str = download(&asset_extension, &filename, &name, &progress_clone, &download_url);
+        let path_str = download(&asset_extension, &filename, &name, &progress_clone, &download_url, &installation_data);
 
         extract(&asset_extension, &sender_clone, &progress_clone, &installation_data, &name, &path_str);
 
         finalize_download(&installation_data, &sender_clone, &filename, &progress_clone);
     });
+}
+
+pub fn update_app_data(app: &mut App) {
+    app.version = app.release_data.tag_name.clone();
+    app.update_download_url = None;
+    app.has_update = false;
+    save_app_data_offline(&app);
 }
 
 fn is_archive(extension: &String) -> bool {
@@ -534,17 +553,33 @@ fn is_archive(extension: &String) -> bool {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct InstallationData {
     pub launchable: bool,
     launch_cmd: Option<String>, // Use {jvm} for java path; Use {app} for app path to executable
-    is_library: bool,
-    is_manager: bool,
+    pub is_library: bool,
+    pub is_manager: bool,
     has_extra_folder: bool,
     extra_folder_key_word: Option<String>,
     extension: Option<String>,
     key_word: Option<String>,
     pub app_path: String,
+}
+
+impl Default for InstallationData {
+    fn default() -> Self {
+        InstallationData {
+            launchable: false,
+            launch_cmd: None,
+            is_library: false,
+            is_manager: false,
+            has_extra_folder: false,
+            extra_folder_key_word: None,
+            extension: None,
+            key_word: None,
+            app_path: String::new(),
+        }
+    }
 }
 
 pub fn get_installation_data(app: &App) -> InstallationData {

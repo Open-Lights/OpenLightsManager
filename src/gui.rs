@@ -1,20 +1,20 @@
 use std::cmp::PartialEq;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::{fs, i32};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use std::{fs, i32};
 
-use egui::{CentralPanel, Color32, Context, FontFamily, FontId, Frame, Image, Pos2, pos2, ProgressBar, Rect, RichText, Rounding, Stroke, TextStyle, Ui, Vec2};
 use egui::TextStyle::Body;
+use egui::{pos2, CentralPanel, Color32, Context, FontFamily, FontId, Frame, Image, Pos2, ProgressBar, Rect, RichText, Rounding, Stroke, TextStyle, Ui, Vec2};
 use egui_file::FileDialog;
 use serde::{Deserialize, Serialize};
 
-use crate::io::{AppEvents, check_for_all_updates, download_application, gather_app_data, get_installation_data, launch_application, save_app_data_offline, should_check_github, update};
+use crate::io::{check_for_all_updates, download_application, gather_app_data, launch_application, save_app_data_offline, should_check_github, update, update_app_data, AppEvents, InstallationData};
 use crate::notifications::{app_installation_failure, app_installation_success, java_failure_corrupted, java_failure_invalid, java_failure_issue, java_success, manager_installation_success, rate_limit_notification};
 use crate::settings::{load_settings, Settings};
 
@@ -477,6 +477,8 @@ pub struct App {
     pub thread_communication: ThreadCommunication,
     #[serde(skip)]
     pub process: Arc<AtomicU32>,
+    #[serde(skip)]
+    pub installation_data: InstallationData,
 }
 
 impl App {
@@ -490,6 +492,7 @@ impl App {
         release_data: ReleaseData,
         has_update: bool,
         launchable: bool,
+        installation_data: InstallationData,
     ) -> Self {
         App {
             installed: false,
@@ -508,6 +511,7 @@ impl App {
             progress: Arc::new(AtomicI8::new(0)),
             thread_communication: ThreadCommunication::default(),
             process: Arc::new(AtomicU32::new(0)),
+            installation_data
         }
     }
 }
@@ -533,6 +537,7 @@ impl App {
                     settings.save_settings();
                     self.installed = true;
                     self.event = AppEvents::None;
+                    update_app_data(self);
                     save_app_data_offline(self);
                     let notification = app_installation_success(&self.name);
                     notify(ui.ctx(), notification, notifications);
@@ -541,6 +546,7 @@ impl App {
                     println!("Manager Installed!");
                     self.installed = true;
                     self.event = AppEvents::None;
+                    update_app_data(self);
                     save_app_data_offline(self);
                     let notification = manager_installation_success();
                     notify(ui.ctx(), notification, notifications);
@@ -550,6 +556,7 @@ impl App {
                     self.installed = true;
                     self.has_update = false;
                     self.event = AppEvents::None;
+                    update_app_data(self);
                     save_app_data_offline(self);
                     let notification = app_installation_success(&self.name);
                     notify(ui.ctx(), notification, notifications);
@@ -560,7 +567,6 @@ impl App {
             }
         }
 
-        let installation_data = get_installation_data(&self);
         ui.allocate_ui(Vec2::from([550., 140.]), |ui| {
             ui.horizontal(|ui| {
                 // Image
@@ -592,35 +598,52 @@ impl App {
                            }
                        };
 
-                       if self.installed && self.has_update {
-                           ui.add_enabled_ui(!installing, |ui| {
-                               if installation_data.launchable && ui.add_sized([50., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
-                                   let notification = launch_application(self, &settings.jvm_path);
-                                   notify(ui.ctx(), notification, notifications);
-                               }
+                       ui.add_enabled_ui(!installing, |ui| {
+                           if self.installed {
+                               if self.has_update {
+                                   if self.installation_data.launchable {
+                                       if ui.add_sized([45., 40.], egui::Button::new(RichText::new(action_button_text).text_style(notification_font()).color(theme.text)).fill(theme.button)).clicked() {
+                                           if self.event == AppEvents::Running {
+                                               // TODO Kill Process
+                                           } else {
+                                               let notification = launch_application(self, &settings.jvm_path);
+                                               notify(ui.ctx(), notification, notifications);
+                                           }
+                                       }
 
-                               if ui.add_sized([50., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
-                                   // TODO Update
-                                   update(&self, &self.progress, &self.thread_communication.event_sender);
-                               }
-                           });
-                       } else {
-                           ui.add_enabled_ui(!installing, |ui| {
-                               if (installation_data.launchable && self.installed) && ui.add_sized([100., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
-                                   if self.installed {
+                                       if ui.add_sized([45., 40.], egui::Button::new(RichText::new("Update").text_style(notification_font()).color(theme.text)).fill(theme.button)).clicked() {
+                                           self.event = AppEvents::Downloading;
+                                           update(&self, &self.progress, &self.thread_communication.event_sender);
+                                       }
+                                   } else if ui.add_sized([100., 40.], egui::Button::new(RichText::new("Update").color(theme.text)).fill(theme.button)).clicked() {
+                                       self.event = AppEvents::Downloading;
+                                       update(&self, &self.progress, &self.thread_communication.event_sender);
+                                   }
+                               } else if self.installation_data.launchable && ui.add_sized([100., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
+                                   if self.event == AppEvents::Running {
+                                       // TODO Kill Process
+                                   } else {
                                        let notification = launch_application(self, &settings.jvm_path);
                                        notify(ui.ctx(), notification, notifications);
-                                   } else {
-                                       self.event = AppEvents::Downloading;
-                                       download_application(self, &self.progress, &self.thread_communication.event_sender);
                                    }
                                }
-                           });
-                       }
+                           } else {
+                               if ui.add_sized([100., 40.], egui::Button::new(RichText::new(action_button_text).color(theme.text)).fill(theme.button)).clicked() {
+                                   self.event = AppEvents::Downloading;
+                                   download_application(self, &self.progress, &self.thread_communication.event_sender);
+                               }
+                           }
+                       });
                    });
                    ui.horizontal(|ui| {
                        // Description
-                       ui.add_sized([320., 40.], egui::Label::new(RichText::new(&self.github_data.description).color(theme.text).text_style(notification_font())));
+
+                       ui.vertical(|ui| {
+                           ui.add_sized([320., 20.], egui::Label::new(RichText::new(&self.github_data.description).color(theme.text).text_style(notification_font())));
+
+                           // Tags
+                           render_tags(self, ui);
+                       });
 
                        // Action Button / Progress Bar
                        if !installing {
@@ -628,7 +651,7 @@ impl App {
                                if ui.add_sized([100., 40.], egui::Button::new(RichText::new("Uninstall").color(theme.text)).fill(theme.button)).clicked() {
                                    let path_str = format!("openlightsmanager/apps/{}/", self.name);
                                    let path = Path::new(&path_str);
-                                   let executable_path_str = get_full_path_str(&self.name, &installation_data.app_path);
+                                   let executable_path_str = get_full_path_str(&self.name, &self.installation_data.app_path);
                                    if path.exists() {
                                        fs::remove_dir_all(path).unwrap();
                                        if executable_path_str == settings.jvm_path {
@@ -652,6 +675,27 @@ impl App {
     }
 }
 
+fn render_tags(app: &App, ui: &mut Ui) {
+    let tag_size = [75., 20.];
+    ui.add_space(5.);
+    ui.horizontal(|ui| {
+        ui.add_space(10.);
+        if app.github_data.archived {
+            ui.add_sized(tag_size, egui::Button::new(RichText::new("Deprecated").text_style(notification_font()).color(Color32::BLACK).background_color(Color32::GOLD)).fill(Color32::GOLD).rounding(Rounding::from(16.)).selected(true));
+        }
+
+        if app.installation_data.is_library {
+            ui.add_sized(tag_size, egui::Button::new(RichText::new("Library").text_style(notification_font()).color(Color32::BLACK).background_color(Color32::LIGHT_BLUE)).fill(Color32::LIGHT_BLUE).rounding(Rounding::from(16.)).selected(true));
+        }
+
+        if app.installation_data.is_manager {
+            ui.add_sized(tag_size, egui::Button::new(RichText::new("Manager").text_style(notification_font()).color(Color32::BLACK).background_color(Color32::RED)).fill(Color32::RED).rounding(Rounding::from(16.)).selected(true));
+        } else if !app.installation_data.is_library && !app.launchable {
+            ui.add_sized(tag_size, egui::Button::new(RichText::new("External").text_style(notification_font()).color(Color32::BLACK).background_color(Color32::LIGHT_GREEN)).fill(Color32::LIGHT_GREEN).rounding(Rounding::from(16.)).selected(true));
+        }
+    });
+}
+
 fn get_full_path_str(name: &String, executable: &String) -> String {
     let path_str = format!("openlightsmanager/apps/{}{}", name, executable);
     let path = Path::new(&path_str);
@@ -664,31 +708,37 @@ fn app_image(name: &String) -> Image<'_> {
         "OpenLightsCore" => {
             Image::new(egui::include_image!("../assets/OpenLightsCore.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         },
         "OpenLightsManager" => {
             Image::new(egui::include_image!("../assets/OpenLightsManager.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         },
         "BeatMaker" => {
             Image::new(egui::include_image!("../assets/BeatMaker.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
-
+                .rounding(Rounding::from(8.))
         },
         "graalvm-ce-builds" => {
             Image::new(egui::include_image!("../assets/graalvm-ce-builds.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         },
         "BeatFileEditor" => {
             Image::new(egui::include_image!("../assets/BeatFileEditor.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         },
         "Christmas-Jukebox" => {
             Image::new(egui::include_image!("../assets/Christmas-Jukebox.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         },
         _ => {
             Image::new(egui::include_image!("../assets/Unknown.png"))
                 .fit_to_exact_size(Vec2 {x: 100., y: 100.})
+                .rounding(Rounding::from(8.))
         }
     }
 }
