@@ -104,7 +104,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           tag_name: ${{ steps.read_toml.outputs.value }}
-          prerelease: false
+          prerelease: ${{ contains(steps.read_toml.outputs.value, 'pre') || contains(steps.read_toml.outputs.value, 'beta') || contains(steps.read_toml.outputs.value, 'rc') }}
           name: Open Lights Manager ${{ steps.read_toml.outputs.value }}
           files: libs/*
           generate_release_notes: true
