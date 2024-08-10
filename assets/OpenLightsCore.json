@@ -3,7 +3,7 @@
     "is_library": false,
     "is_manager": false,
     "has_extra_folder": false,
-    "extension": "",
-    "key_word": "",
-    "app_path": "/"
+    "extension": "exe",
+    "key_word": "x86_64-pc-windows-msvc",
+    "app_path": "/open_lights_core-x86_64-pc-windows-msvc.exe"
 }

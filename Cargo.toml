@@ -1,6 +1,6 @@
 [package]
 name = "open_lights_manager"
-version = "1.0.0"
+version = "1.0.0-pre.1"
 edition = "2021"
 authors = ["QPCrummer"]
 include = ["**/*.rs", "Cargo.toml"]

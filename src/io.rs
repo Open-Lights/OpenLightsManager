@@ -1,4 +1,5 @@
 use std::{fs, io, thread};
+use std::env::current_dir;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -39,6 +40,10 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
             let reader = BufReader::new(file);
             let mut app: App = serde_json::from_reader(reader).unwrap();
             app.installation_data = get_installation_data(&app);
+            if &app.installation_data.is_manager {
+                app.installed = true;
+                // TODO Write the first manager json to file
+            }
             check_for_updates(&mut app, prerelease, settings, false);
             vector.push(app);
         } else {
@@ -80,9 +85,13 @@ pub fn gather_app_data(prerelease: bool, settings: &mut Settings) -> (Vec<App>, 
                     installation_data: InstallationData::default(),
                 };
                 let installation_data = get_installation_data(&app);
-                app.app_path = installation_data.app_path.clone(); //TODO Proper app path
+                app.app_path = installation_data.app_path.clone();
                 app.launchable = installation_data.launchable;
                 app.installation_data = installation_data;
+                if &app.installation_data.is_manager {
+                    app.installed = true;
+                    // TODO Write the first manager json to file
+                }
                 save_app_data_offline(&app);
                 vector.push(app);
             }
@@ -363,24 +372,24 @@ pub fn download_application(app: &App, progress: &Arc<AtomicI8>, sender: &Arc<Se
 }
 
 fn download(asset_extension: &String, filename: &str, name: &String, progress_clone: &Arc<AtomicI8>, download_url: &String, installation_data: &InstallationData) -> String {
-    let path_str = if is_archive(&asset_extension) {
-        format!("openlightsmanager/apps/{}", filename)
+    let path_str;
+    if installation_data.is_manager {
+        path_str = format!("{}/{}", current_dir().unwrap().to_string_lossy(), format!("NEW-{}", filename));
     } else {
-        let parent_str =   format!("openlightsmanager/apps/{}/", name);
-        let parent_path = Path::new(&parent_str);
-        if !parent_path.exists() {
-            fs::create_dir_all(parent_path).unwrap();
-        }
-        format!("{}{}", parent_str, filename)
-    };
+        path_str = if is_archive(&asset_extension) {
+            format!("openlightsmanager/apps/{}", filename)
+        } else {
+            let parent_str =   format!("openlightsmanager/apps/{}/", name);
+            let parent_path = Path::new(&parent_str);
+            if !parent_path.exists() {
+                fs::create_dir_all(parent_path).unwrap();
+            }
+            format!("{}{}", parent_str, filename)
+        };
+    }
+
     let rt = Runtime::new().unwrap();
     rt.block_on(get_file(download_url, path_str.clone(), &progress_clone));
-    if installation_data.is_manager {
-        let original = Path::new(&path_str);
-        let new_str = path_str.replace(filename, format!("NEW-{}", filename).as_str());
-        let new_path = Path::new(&new_str);
-        fs::rename(original, new_path).unwrap();
-    }
     path_str
 }
 
